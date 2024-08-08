@@ -246,13 +246,25 @@ static void stdout_add_bitmap(int i, __u8 seb)
 	}
 }
 
+static void stdout_persistent_event_log_fdp_events(unsigned int cdw11,
+						   unsigned int cdw12,
+						   unsigned char *buf)
+{
+	unsigned int num = (cdw11 >> 16) & 0xff;
+
+	for (unsigned int i = 0; i < num; i++) {
+		printf("\t%-53s: %sEnabled\n", nvme_fdp_event_to_string(buf[0]),
+				cdw12 & 0x1 ? "" : "Not ");
+	}
+}
+
 static void stdout_persistent_event_log(void *pevent_log_info,
 					__u8 action, __u32 size,
 					const char *devname)
 {
 	__u32 offset, por_info_len, por_info_list;
 	__u64 *fw_rev;
-	int fid, cdw11, dword_cnt;
+	int fid, cdw11, cdw12, dword_cnt;
 	unsigned char *mem_buf = NULL;
 	struct nvme_smart_log *smart_event;
 	struct nvme_fw_commit_event *fw_commit_event;
@@ -488,8 +500,13 @@ static void stdout_persistent_event_log(void *pevent_log_info,
 			printf("Set Feature ID  :%#02x (%s),  value:%#08x\n", fid,
 				nvme_feature_to_string(fid), cdw11);
 			if (NVME_SET_FEAT_EVENT_MB_COUNT(set_feat_event->layout)) {
-				mem_buf = (unsigned char *)(set_feat_event + 4 + dword_cnt * 4);
-				stdout_feature_show_fields(fid, cdw11, mem_buf);
+				mem_buf = (unsigned char *)set_feat_event + 4 + dword_cnt * 4;
+				if (fid == NVME_FEAT_FID_FDP_EVENTS) {
+					cdw12 = le32_to_cpu(set_feat_event->cdw_mem[2]);
+					stdout_persistent_event_log_fdp_events(cdw11, cdw12,
+									       mem_buf);
+				} else
+					stdout_feature_show_fields(fid, cdw11, mem_buf);
 			}
 			break;
 		case NVME_PEL_TELEMETRY_CRT:
@@ -1046,6 +1063,18 @@ static void stdout_subsystem_ctrls(nvme_subsystem_t s)
 	}
 }
 
+static void stdout_subsys_config(nvme_subsystem_t s)
+{
+	int len = strlen(nvme_subsystem_get_name(s));
+
+	printf("%s - NQN=%s\n", nvme_subsystem_get_name(s),
+	       nvme_subsystem_get_nqn(s));
+	printf("%*s   hostnqn=%s\n", len, " ",
+	       nvme_host_get_hostnqn(nvme_subsystem_get_host(s)));
+	printf("%*s   iopolicy=%s\n", len, " ",
+	       nvme_subsystem_get_iopolicy(s));
+}
+
 static void stdout_subsystem(nvme_root_t r, bool show_ana)
 {
 	nvme_host_t h;
@@ -1055,18 +1084,11 @@ static void stdout_subsystem(nvme_root_t r, bool show_ana)
 		nvme_subsystem_t s;
 
 		nvme_for_each_subsystem(h, s) {
-			int len = strlen(nvme_subsystem_get_name(s));
-
 			if (!first)
 				printf("\n");
 			first = false;
 
-			printf("%s - NQN=%s\n", nvme_subsystem_get_name(s),
-			       nvme_subsystem_get_nqn(s));
-			printf("%*s   hostnqn=%s\n", len, " ",
-			       nvme_host_get_hostnqn(nvme_subsystem_get_host(s)));
-			printf("%*s   iopolicy=%s\n", len, " ",
-			       nvme_subsystem_get_iopolicy(s));
+			stdout_subsys_config(s);
 			printf("\\\n");
 
 			if (!show_ana || !stdout_subsystem_multipath(s))
@@ -1709,7 +1731,8 @@ static void stdout_id_ctrl_ctratt(__le32 ctrl_ctratt)
 	__u32 ctratt = le32_to_cpu(ctrl_ctratt);
 	__u32 rsvd20 = (ctratt >> 20);
 	__u32 fdps = (ctratt >> 19) & 0x1;
-	__u32 rsvd17 = (ctratt >> 17) & 0x3;
+	__u32 rsvd18 = (ctratt >> 18) & 0x1;
+	__u32 hmbr = (ctratt >> 17) & 0x1;
 	__u32 mem = (ctratt >> 16) & 0x1;
 	__u32 elbas = (ctratt >> 15) & 0x1;
 	__u32 delnvmset = (ctratt >> 14) & 0x1;
@@ -1732,8 +1755,10 @@ static void stdout_id_ctrl_ctratt(__le32 ctrl_ctratt)
 		printf(" [31:20] : %#x\tReserved\n", rsvd20);
 	printf("  [19:19] : %#x\tFlexible Data Placement %sSupported\n",
 		fdps, fdps ? "" : "Not ");
-	if (rsvd17)
-		printf("  [18:17] : %#x\tReserved\n", rsvd17);
+	if (rsvd18)
+		printf("  [18:18] : %#x\tReserved\n", rsvd18);
+	printf("  [17:17] : %#x\tHMB Restrict Non-Operational Power State Access %sSupported\n",
+		hmbr, hmbr ? "" : "Not ");
 	printf("  [16:16] : %#x\tMDTS and Size Limits Exclude Metadata %sSupported\n",
 		mem, mem ? "" : "Not ");
 	printf("  [15:15] : %#x\tExtended LBA Formats %sSupported\n",
@@ -1963,15 +1988,15 @@ static void stdout_id_ctrl_apsta(__u8 apsta)
 
 static void stdout_id_ctrl_wctemp(__le16 wctemp)
 {
-	printf(" [15:0] : %ld °C (%u K)\tWarning Composite Temperature Threshold (WCTEMP)\n",
-	       kelvin_to_celsius(le16_to_cpu(wctemp)), le16_to_cpu(wctemp));
+	printf(" [15:0] : %s (%u K)\tWarning Composite Temperature Threshold (WCTEMP)\n",
+	       nvme_degrees_string(le16_to_cpu(wctemp)), le16_to_cpu(wctemp));
 	printf("\n");
 }
 
 static void stdout_id_ctrl_cctemp(__le16 cctemp)
 {
-	printf(" [15:0] : %ld °C (%u K)\tCritical Composite Temperature Threshold (CCTEMP)\n",
-	       kelvin_to_celsius(le16_to_cpu(cctemp)), le16_to_cpu(cctemp));
+	printf(" [15:0] : %s (%u K)\tCritical Composite Temperature Threshold (CCTEMP)\n",
+	       nvme_degrees_string(le16_to_cpu(cctemp)), le16_to_cpu(cctemp));
 	printf("\n");
 }
 
@@ -2020,15 +2045,15 @@ static void stdout_id_ctrl_hctma(__le16 ctrl_hctma)
 
 static void stdout_id_ctrl_mntmt(__le16 mntmt)
 {
-	printf(" [15:0] : %ld °C (%u K)\tMinimum Thermal Management Temperature (MNTMT)\n",
-	       kelvin_to_celsius(le16_to_cpu(mntmt)), le16_to_cpu(mntmt));
+	printf(" [15:0] : %s (%u K)\tMinimum Thermal Management Temperature (MNTMT)\n",
+	       nvme_degrees_string(le16_to_cpu(mntmt)), le16_to_cpu(mntmt));
 	printf("\n");
 }
 
 static void stdout_id_ctrl_mxtmt(__le16 mxtmt)
 {
-	printf(" [15:0] : %ld °C (%u K)\tMaximum Thermal Management Temperature (MXTMT)\n",
-	       kelvin_to_celsius(le16_to_cpu(mxtmt)), le16_to_cpu(mxtmt));
+	printf(" [15:0] : %s (%u K)\tMaximum Thermal Management Temperature (MXTMT)\n",
+	       nvme_degrees_string(le16_to_cpu(mxtmt)), le16_to_cpu(mxtmt));
 	printf("\n");
 }
 
@@ -2340,17 +2365,18 @@ static void stdout_id_ctrl_ofcs(__le16 ofcs)
 
 static void stdout_id_ns_nsfeat(__u8 nsfeat)
 {
-	__u8 rsvd = (nsfeat & 0xE0) >> 5;
-	__u8 ioopt = (nsfeat & 0x10) >> 4;
+	__u8 rsvd = (nsfeat & 0xC0) >> 6;
+	__u8 optperf = (nsfeat & 0x30) >> 4;
 	__u8 uidreuse = (nsfeat & 0x8) >> 3;
 	__u8 dulbe = (nsfeat & 0x4) >> 2;
 	__u8 na = (nsfeat & 0x2) >> 1;
 	__u8 thin = nsfeat & 0x1;
 
 	if (rsvd)
-		printf("  [7:5] : %#x\tReserved\n", rsvd);
-	printf("  [4:4] : %#x\tNPWG, NPWA, NPDG, NPDA, and NOWS are %sSupported\n",
-		ioopt, ioopt ? "" : "Not ");
+		printf("  [7:6] : %#x\tReserved\n", rsvd);
+	printf("  [5:4] : %#x\tNPWG, NPWA, %s%sNPDA, and NOWS are %sSupported\n",
+		optperf, ((optperf & 0x1) || (!optperf)) ? "NPDG, " : "",
+		((optperf & 0x2) || (!optperf)) ? "NPDGL, " : "", optperf ? "" : "Not ");
 	printf("  [3:3] : %#x\tNGUID and EUI64 fields if non-zero, %sReused\n",
 		uidreuse, uidreuse ? "Never " : "");
 	printf("  [2:2] : %#x\tDeallocated or Unwritten Logical Block error %sSupported\n",
@@ -2583,10 +2609,11 @@ static void stdout_id_ns(struct nvme_id_ns *ns, unsigned int nsid,
 		printf("noiob   : %d\n", le16_to_cpu(ns->noiob));
 		printf("nvmcap  : %s\n",
 			uint128_t_to_l10n_string(le128_to_cpu(ns->nvmcap)));
-		if (ns->nsfeat & 0x10) {
+		if (ns->nsfeat & 0x30) {
 			printf("npwg    : %u\n", le16_to_cpu(ns->npwg));
 			printf("npwa    : %u\n", le16_to_cpu(ns->npwa));
-			printf("npdg    : %u\n", le16_to_cpu(ns->npdg));
+			if (ns->nsfeat & 0x10)
+				printf("npdg    : %u\n", le16_to_cpu(ns->npdg));
 			printf("npda    : %u\n", le16_to_cpu(ns->npda));
 			printf("nows    : %u\n", le16_to_cpu(ns->nows));
 		}
@@ -3026,8 +3053,22 @@ static void stdout_id_ctrl(struct nvme_id_ctrl *ctrl,
 	}
 }
 
+static void stdout_id_ctrl_nvm_aocs(__u16 aocs)
+{
+	__u16 rsvd = (aocs & 0xfffe) >> 1;
+	__u8 ralbas = aocs & 0x1;
+
+	if (rsvd)
+		printf("  [15:1] : %#x\tReserved\n", rsvd);
+	printf("  [0:0] : %#x\tReporting Allocated LBA %sSupported\n", ralbas,
+		ralbas ? "" : "Not ");
+	printf("\n");
+}
+
 static void stdout_id_ctrl_nvm(struct nvme_id_ctrl_nvm *ctrl_nvm)
 {
+	int verbose = stdout_print_ops.flags & VERBOSE;
+
 	printf("NVMe Identify Controller NVM:\n");
 	printf("vsl    : %u\n", ctrl_nvm->vsl);
 	printf("wzsl   : %u\n", ctrl_nvm->wzsl);
@@ -3035,6 +3076,9 @@ static void stdout_id_ctrl_nvm(struct nvme_id_ctrl_nvm *ctrl_nvm)
 	printf("dmrl   : %u\n", ctrl_nvm->dmrl);
 	printf("dmrsl  : %u\n", le32_to_cpu(ctrl_nvm->dmrsl));
 	printf("dmsl   : %"PRIu64"\n", le64_to_cpu(ctrl_nvm->dmsl));
+	printf("aocs   : %u\n", le16_to_cpu(ctrl_nvm->aocs));
+	if (verbose)
+		stdout_id_ctrl_nvm_aocs(le16_to_cpu(ctrl_nvm->aocs));
 }
 
 static void stdout_nvm_id_ns_pic(__u8 pic)
@@ -3130,6 +3174,9 @@ static void stdout_nvm_id_ns(struct nvme_nvm_id_ns *nvm_ns, unsigned int nsid,
 			printf("elbaf %2d : qpif:%d pif:%d sts:%-2d %s\n", i,
 				qpif, pif, sts, i == lbaf ? in_use : "");
 	}
+	if (ns->nsfeat & 0x20)
+		printf("npdgl : %#x\n", le32_to_cpu(nvm_ns->npdgl));
+	printf("tlbaag: %#x\n", le32_to_cpu(nvm_ns->tlbaag));
 }
 
 static void stdout_zns_id_ctrl(struct nvme_zns_id_ctrl *ctrl)
@@ -3715,6 +3762,13 @@ static void stdout_effects_log_human(FILE *stream, __u32 effect)
 	fprintf(stream, "  CCC%s", (effect & NVME_CMD_EFFECTS_CCC) ? set : clr);
 	fprintf(stream, "  USS%s", (effect & NVME_CMD_EFFECTS_UUID_SEL) ? set : clr);
 
+	if ((effect & NVME_CMD_EFFECTS_CSER_MASK) >> 14 == 0)
+		fprintf(stream, "  No CSER defined\n");
+	else if ((effect & NVME_CMD_EFFECTS_CSER_MASK) >> 14 == 1)
+		fprintf(stream, "  No admin command for any namespace\n");
+	else
+		fprintf(stream, "  Reserved CSER\n");
+
 	if ((effect & NVME_CMD_EFFECTS_CSE_MASK) >> 16 == 0)
 		fprintf(stream, "  No command restriction\n");
 	else if ((effect & NVME_CMD_EFFECTS_CSE_MASK) >> 16 == 1)
@@ -3878,7 +3932,6 @@ static void stdout_smart_log(struct nvme_smart_log *smart, unsigned int nsid, co
 	__u16 temperature = smart->temperature[1] << 8 | smart->temperature[0];
 	int i;
 	bool human = stdout_print_ops.flags & VERBOSE;
-	bool fahrenheit = !!(stdout_print_ops.flags & FAHRENHEIT);
 
 	printf("Smart Log for NVME device:%s namespace-id:%x\n", devname, nsid);
 	printf("critical_warning			: %#x\n", smart->critical_warning);
@@ -3899,7 +3952,7 @@ static void stdout_smart_log(struct nvme_smart_log *smart, unsigned int nsid, co
 	}
 
 	printf("temperature				: %s (%u K)\n",
-	       nvme_degrees_string(temperature, fahrenheit), temperature);
+	       nvme_degrees_string(temperature), temperature);
 	printf("available_spare				: %u%%\n", smart->avail_spare);
 	printf("available_spare_threshold		: %u%%\n", smart->spare_thresh);
 	printf("percentage_used				: %u%%\n", smart->percent_used);
@@ -3936,7 +3989,7 @@ static void stdout_smart_log(struct nvme_smart_log *smart, unsigned int nsid, co
 		if (!temperature)
 			continue;
 		printf("Temperature Sensor %d			: %s (%u K)\n", i + 1,
-		       nvme_degrees_string(temperature, fahrenheit), temperature);
+		       nvme_degrees_string(temperature), temperature);
 	}
 
 	printf("Thermal Management T1 Trans Count	: %u\n",
@@ -4448,8 +4501,8 @@ static void stdout_feature_show_fields(enum nvme_features_id fid,
 		field = (result & 0x000f0000) >> 16;
 		printf("\tThreshold Temperature Select (TMPSEL): %u - %s\n",
 		       field, nvme_feature_temp_sel_to_string(field));
-		printf("\tTemperature Threshold         (TMPTH): %ld °C (%u K)\n",
-		       kelvin_to_celsius(result & 0x0000ffff), result & 0x0000ffff);
+		printf("\tTemperature Threshold         (TMPTH): %s (%u K)\n",
+		       nvme_degrees_string(result & 0x0000ffff), result & 0x0000ffff);
 		break;
 	case NVME_FEAT_FID_ERR_RECOVERY:
 		printf("\tDeallocated or Unwritten Logical Block Error Enable (DULBE): %s\n",
@@ -4503,6 +4556,10 @@ static void stdout_feature_show_fields(enum nvme_features_id fid,
 		break;
 	case NVME_FEAT_FID_HOST_MEM_BUF:
 		printf("\tEnable Host Memory (EHM): %s\n", (result & 0x00000001) ? "Enabled" : "Disabled");
+		printf("\tHost Memory Non-operational Access Restriction Enable (HMNARE): %s\n",
+				(result & 0x00000004) ? "True" : "False");
+		printf("\tHost Memory Non-operational Access Restricted (HMNAR): %s\n",
+				(result & 0x00000008) ? "True" : "False");
 		if (buf)
 			stdout_host_mem_buffer((struct nvme_host_mem_buf_attrs *)buf);
 		break;
@@ -4514,10 +4571,10 @@ static void stdout_feature_show_fields(enum nvme_features_id fid,
 		printf("\tKeep Alive Timeout (KATO) in milliseconds: %u\n", result);
 		break;
 	case NVME_FEAT_FID_HCTM:
-		printf("\tThermal Management Temperature 1 (TMT1) : %u K (%ld °C)\n",
-		       result >> 16, kelvin_to_celsius(result >> 16));
-		printf("\tThermal Management Temperature 2 (TMT2) : %u K (%ld °C)\n",
-		       result & 0x0000ffff, kelvin_to_celsius(result & 0x0000ffff));
+		printf("\tThermal Management Temperature 1 (TMT1) : %u K (%s)\n",
+		       result >> 16, nvme_degrees_string(result >> 16));
+		printf("\tThermal Management Temperature 2 (TMT2) : %u K (%s)\n",
+		       result & 0x0000ffff, nvme_degrees_string(result & 0x0000ffff));
 		break;
 	case NVME_FEAT_FID_NOPSC:
 		printf("\tNon-Operational Power State Permissive Mode Enable (NOPPME): %s\n",
@@ -5041,18 +5098,11 @@ static void stdout_simple_topology(nvme_root_t r,
 
 	nvme_for_each_host(r, h) {
 		nvme_for_each_subsystem(h, s) {
-			int len = strlen(nvme_subsystem_get_name(s));
-
 			if (!first)
 				printf("\n");
 			first = false;
 
-			printf("%s - NQN=%s\n", nvme_subsystem_get_name(s),
-			       nvme_subsystem_get_nqn(s));
-			printf("%*s   hostnqn=%s\n", len, " ",
-			       nvme_host_get_hostnqn(nvme_subsystem_get_host(s)));
-			printf("%*s   iopolicy=%s\n", len, " ",
-			       nvme_subsystem_get_iopolicy(s));
+			stdout_subsys_config(s);
 			printf("\\\n");
 
 			if (nvme_is_multipath(s))
@@ -5216,7 +5266,7 @@ static struct print_ops stdout_print_ops = {
 	.show_error_status		= stdout_error_status,
 };
 
-struct print_ops *nvme_get_stdout_print_ops(enum nvme_print_flags flags)
+struct print_ops *nvme_get_stdout_print_ops(nvme_print_flags_t flags)
 {
 	stdout_print_ops.flags = flags;
 	return &stdout_print_ops;

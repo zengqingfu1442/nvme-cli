@@ -46,6 +46,9 @@ linknvme:nvme-micron-smart-add-log[1]::
 linknvme:nvme-micron-temperature-stats[1]::
 	Retrieves temperature information of given micron device
 
+linknvme:nvme-ocp-internal-log[1]::
+	Retrieves and parses OCP Telemetry DA1 and DA2 logs.
+
 linknvme:nvme-netapp-ontapdevices[1]::
 	Display information about ONTAP devices
 
@@ -201,3 +204,6 @@ linknvme:nvme-zns-zrwa-flush-zone[1]::
 
 linknvme:nvme-inspur-nvme-vendor-log[1]::
 	NVMe Inspur Device Vendor log page request
+
+linknvme:nvme-dapustor-smart-log-add[1]::
+	NVMe DapuStor Additional SMART log page

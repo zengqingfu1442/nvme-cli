@@ -269,10 +269,11 @@ static void json_nvme_id_ns(struct nvme_id_ns *ns, unsigned int nsid,
 		obj_add_int(r, "nsattr", ns->nsattr);
 		obj_add_int(r, "nvmsetid", le16_to_cpu(ns->nvmsetid));
 
-		if (ns->nsfeat & 0x10) {
+		if (ns->nsfeat & 0x30) {
 			obj_add_int(r, "npwg", le16_to_cpu(ns->npwg));
 			obj_add_int(r, "npwa", le16_to_cpu(ns->npwa));
-			obj_add_int(r, "npdg", le16_to_cpu(ns->npdg));
+			if (ns->nsfeat & 0x10)
+				obj_add_int(r, "npdg", le16_to_cpu(ns->npdg));
 			obj_add_int(r, "npda", le16_to_cpu(ns->npda));
 			obj_add_int(r, "nows", le16_to_cpu(ns->nows));
 		}
@@ -3032,6 +3033,7 @@ static void json_nvme_id_ctrl_nvm(struct nvme_id_ctrl_nvm *ctrl_nvm)
 	obj_add_uint(r, "dmrl", ctrl_nvm->dmrl);
 	obj_add_uint(r, "dmrsl", le32_to_cpu(ctrl_nvm->dmrsl));
 	obj_add_uint64(r, "dmsl", le64_to_cpu(ctrl_nvm->dmsl));
+	obj_add_uint(r, "aocs", le16_to_cpu(ctrl_nvm->aocs));
 
 	json_print(r);
 }
@@ -3063,6 +3065,9 @@ static void json_nvme_nvm_id_ns(struct nvme_nvm_id_ns *nvm_ns,
 
 		array_add_obj(elbafs, elbaf);
 	}
+	if (ns->nsfeat & 0x20)
+		obj_add_int(r, "npdgl", le32_to_cpu(nvm_ns->npdgl));
+	obj_add_uint(r, "tlbaag", le32_to_cpu(nvm_ns->tlbaag));
 
 	json_print(r);
 }
@@ -3297,7 +3302,7 @@ static void json_feature_show_fields_temp_thresh(struct json_object *r, unsigned
 	obj_add_uint(r, "Threshold Temperature Select (TMPSEL)", field);
 	obj_add_str(r, "TMPSEL description", nvme_feature_temp_sel_to_string(field));
 
-	sprintf(json_str, "%ld Celsius", kelvin_to_celsius(result & 0xffff));
+	sprintf(json_str, "%s", nvme_degrees_string(result & 0xffff));
 	obj_add_str(r, "Temperature Threshold (TMPTH)", json_str);
 
 	sprintf(json_str, "%u K", result & 0xffff);
@@ -3422,6 +3427,10 @@ static void json_feature_show_fields_host_mem_buf(struct json_object *r, unsigne
 						  unsigned char *buf)
 {
 	obj_add_str(r, "Enable Host Memory (EHM)", result & 1 ? "Enabled" : "Disabled");
+	obj_add_str(r, "Host Memory Non-operational Access Restriction Enable (HMNARE)",
+			(result & 0x00000004) ? "True" : "False");
+	obj_add_str(r, "Host Memory Non-operational Access Restricted (HMNAR)",
+			(result & 0x00000008) ? "True" : "False");
 
 	if (buf)
 		json_host_mem_buffer((struct nvme_host_mem_buf_attrs *)buf, r);
@@ -3467,13 +3476,13 @@ static void json_feature_show_fields_hctm(struct json_object *r, unsigned int re
 	sprintf(json_str, "%u K", result >> 16);
 	obj_add_str(r, "Thermal Management Temperature 1 (TMT1)", json_str);
 
-	sprintf(json_str, "%ld Celsius", kelvin_to_celsius(result >> 16));
+	sprintf(json_str, "%s", nvme_degrees_string(result >> 16));
 	obj_add_str(r, "TMT1 celsius", json_str);
 
 	sprintf(json_str, "%u K", result & 0xffff);
 	obj_add_str(r, "Thermal Management Temperature 2", json_str);
 
-	sprintf(json_str, "%ld Celsius", kelvin_to_celsius(result & 0xffff));
+	sprintf(json_str, "%s", nvme_degrees_string(result & 0xffff));
 	obj_add_str(r, "TMT2 celsius", json_str);
 }
 
@@ -4739,7 +4748,7 @@ static struct print_ops json_print_ops = {
 	.show_error_status		= json_output_error_status,
 };
 
-struct print_ops *nvme_get_json_print_ops(enum nvme_print_flags flags)
+struct print_ops *nvme_get_json_print_ops(nvme_print_flags_t flags)
 {
 	json_print_ops.flags = flags;
 	return &json_print_ops;

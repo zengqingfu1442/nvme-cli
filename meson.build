@@ -4,7 +4,7 @@ project(
     'nvme-cli', ['c'],
     meson_version: '>= 0.50.0',
     license: 'GPL-2.0-only',
-    version: '2.9.1',
+    version: '2.10.2',
     default_options: [
       'c_std=gnu99',
       'buildtype=debugoptimized',
@@ -48,7 +48,7 @@ conf.set('SYSCONFDIR', '"@0@"'.format(sysconfdir))
 conf.set('RUNDIR', '"@0@"'.format(rundir))
 
 # Check for libnvme availability
-libnvme_dep = dependency('libnvme', version: '>=1.9', required: true,
+libnvme_dep = dependency('libnvme', version: '>=1.10', required: true,
                          fallback : ['libnvme', 'libnvme_dep'])
 libnvme_mi_dep = dependency('libnvme-mi', required: true,
                          fallback : ['libnvme', 'libnvme_mi_dep'])
@@ -352,7 +352,8 @@ if meson.version().version_compare('>=0.53.0')
     }
     summary(dep_dict, section: 'Dependencies')
     conf_dict = {
-        'pdc enabled':       get_option('pdc-enabled')
+        'git version':       conf.get('GIT_VERSION'),
+        'pdc enabled':       get_option('pdc-enabled'),
     }
     summary(conf_dict, section: 'Configuration')
 endif

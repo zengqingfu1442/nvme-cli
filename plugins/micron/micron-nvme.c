@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Copyright (c) Micron, Inc 2024.
+ *
+ * @file: micron-nvme.c
+ * @brief: This module contains all the constructs needed for micron nvme-cli plugin.
+ * @authors:Chaithanya Shoba <ashoba@micron.com>,
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -9,6 +17,8 @@
 #include <time.h>
 #include <string.h>
 #include <libgen.h>
+#include <stddef.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include "common.h"
 #include "nvme.h"
@@ -17,6 +27,7 @@
 #include "linux/types.h"
 #include "nvme-print.h"
 #include "util/cleanup.h"
+#include "util/utils.h"
 
 #define CREATE_CMD
 #include "micron-nvme.h"
@@ -1191,14 +1202,8 @@ static void init_d0_log_page(__u8 *buf, __u8 nsze)
 	sprintf(d0_log_page[6].datastr, "0x%x", logD0[1]);
 }
 
-/* OCP and Vendor specific log data format */
-struct micron_vs_logpage {
-	char *field;
-	int  size;	/* FB client spec version 1.0 sizes - M5410 models */
-	int  size2; /* FB client spec version 0.7 sizes - M5407 models */
-}
 /* Smart Health Log information as per OCP spec M51CX models */
-ocp_c0_log_page[] = {
+struct request_data ocp_c0_log_page[] = {
 	{ "Physical Media Units Written", 16},
 	{ "Physical Media Units Read", 16 },
 	{ "Raw Bad User NAND Block Count", 6},
@@ -1317,82 +1322,6 @@ fb_log_page[] = {
 	{ "Log Page GUID", 0, 16},
 };
 
-/*
- * Common function to print Micron VS log pages
- * - buf: raw log data
- * - log_page: format of the data
- * - field_count: log field count
- * - stats: json object to add fields
- * - spec: ocp spec index
- */
-static void print_micron_vs_logs(__u8 *buf, struct micron_vs_logpage *log_page, int field_count,
-				 struct json_object *stats, __u8 spec)
-{
-	__u64 lval_lo, lval_hi;
-	__u32 ival;
-	__u16 sval;
-	__u8  cval, lval[8] = { 0 };
-	int field;
-	int offset = 0;
-
-	for (field = 0; field < field_count; field++) {
-		char datastr[1024] = { 0 };
-		char *sfield = NULL;
-		int size = !spec ? log_page[field].size : log_page[field].size2;
-
-		if (!size)
-			continue;
-		sfield = log_page[field].field;
-		if (size == 16) {
-			if (strstr(sfield, "GUID")) {
-				sprintf(datastr, "0x%"PRIx64"%"PRIx64"",
-						(uint64_t)le64_to_cpu(*(uint64_t *)(&buf[offset + 8])),
-						(uint64_t)le64_to_cpu(*(uint64_t *)(&buf[offset])));
-			} else {
-				lval_lo = *((__u64 *)(&buf[offset]));
-				lval_hi = *((__u64 *)(&buf[offset + 8]));
-				if (lval_hi)
-					sprintf(datastr, "0x%"PRIx64"%016"PRIx64"",
-						le64_to_cpu(lval_hi), le64_to_cpu(lval_lo));
-				else
-					sprintf(datastr, "0x%"PRIx64"", le64_to_cpu(lval_lo));
-			}
-		} else if (size == 8) {
-			lval_lo = *((__u64 *)(&buf[offset]));
-			sprintf(datastr, "0x%"PRIx64"", le64_to_cpu(lval_lo));
-		} else if (size == 7) {
-			/* 7 bytes will be in little-endian format, with last byte as MSB */
-			memcpy(&lval[0], &buf[offset], 7);
-			memcpy((void *)&lval_lo, lval, 8);
-			sprintf(datastr, "0x%"PRIx64"", le64_to_cpu(lval_lo));
-		} else if (size == 6) {
-			ival	= *((__u32 *)(&buf[offset]));
-			sval	= *((__u16 *)(&buf[offset + 4]));
-			lval_lo = (((__u64)sval << 32) | ival);
-			sprintf(datastr, "0x%"PRIx64"", le64_to_cpu(lval_lo));
-		} else if (size == 4) {
-			ival	= *((__u32 *)(&buf[offset]));
-			sprintf(datastr, "0x%x", le32_to_cpu(ival));
-		} else if (size == 2) {
-			sval = *((__u16 *)(&buf[offset]));
-			sprintf(datastr, "0x%04x", le16_to_cpu(sval));
-		} else if (size == 1) {
-			cval = buf[offset];
-			sprintf(datastr, "0x%02x", cval);
-		} else {
-			sprintf(datastr, "0");
-		}
-		offset += size;
-		/* do not print reserved values */
-		if (strstr(sfield, "Reserved"))
-			continue;
-		if (stats)
-			json_object_add_value_string(stats, sfield, datastr);
-		else
-			printf("%-40s : %-4s\n", sfield, datastr);
-	}
-}
-
 static void print_smart_cloud_health_log(__u8 *buf, bool is_json)
 {
 	struct json_object *root;
@@ -1408,7 +1337,7 @@ static void print_smart_cloud_health_log(__u8 *buf, bool is_json)
 					    logPages);
 	}
 
-	print_micron_vs_logs(buf, ocp_c0_log_page, field_count, stats, 0);
+	generic_structure_parser(buf, ocp_c0_log_page, field_count, stats, 0, NULL);
 
 	if (is_json) {
 		json_array_add_value_object(logPages, stats);
@@ -1433,7 +1362,7 @@ static void print_nand_stats_fb(__u8 *buf, __u8 *buf2, __u8 nsze, bool is_json, 
 					    logPages);
 	}
 
-	print_micron_vs_logs(buf, fb_log_page, field_count, stats, spec);
+	generic_structure_parser(buf, fb_log_page, field_count, stats, spec, NULL);
 
 	/* print last three entries from D0 log page */
 	if (buf2) {
@@ -1587,7 +1516,7 @@ static void print_ext_smart_logs_e1(__u8 *buf, bool is_json)
 		printf("SMART Extended Log:0xE1\n");
 	}
 
-	print_micron_vs_logs(buf, e1_log_page, field_count, stats, 0);
+	generic_structure_parser(buf, e1_log_page, field_count, stats, 0, NULL);
 
 	if (is_json) {
 		json_array_add_value_object(logPages, stats);
@@ -1756,6 +1685,7 @@ static void GetGenericLogs(int fd, const char *dir)
 	struct nvme_firmware_slot fw_log;
 	struct nvme_cmd_effects_log effects;
 	struct nvme_persistent_event_log pevent_log;
+
 	_cleanup_huge_ struct nvme_mem_huge mh = { 0, };
 	void *pevent_log_info = NULL;
 	__u32 log_len = 0;

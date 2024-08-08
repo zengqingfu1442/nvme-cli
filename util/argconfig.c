@@ -30,6 +30,7 @@
  */
 
 #include "argconfig.h"
+#include "cleanup.h"
 #include "suffix.h"
 
 #include <errno.h>
@@ -43,10 +44,12 @@
 #include <stdbool.h>
 #include <locale.h>
 
-static const char *append_usage_str = "";
+static bool is_null_or_empty(const char *s)
+{
+	return !s || !*s;
+}
 
-static int argconfig_parse_val(struct argconfig_commandline_options *s, struct option *option,
-			       int index);
+static const char *append_usage_str = "";
 
 void argconfig_append_usage(const char *str)
 {
@@ -134,7 +137,7 @@ void argconfig_print_help(const char *program_desc,
 		return;
 
 	fprintf(stderr, "\n\033[1mOptions:\033[0m\n");
-	for (; s && s->option; s++)
+	for (; s->option; s++)
 		show_option(s);
 }
 
@@ -144,23 +147,9 @@ static int argconfig_error(char *type, const char *opt, const char *arg)
 	return -EINVAL;
 }
 
-int argconfig_parse_byte(const char *opt, const char *str, unsigned char *val)
+static int argconfig_parse_type(struct argconfig_commandline_options *s)
 {
-	char *endptr;
-	unsigned long tmp = strtoul(str, &endptr, 0);
-
-	if (errno || tmp >= 1 << 8 || str == endptr)
-		return argconfig_error("byte", opt, str);
-
-	*val = tmp;
-
-	return 0;
-}
-
-static int argconfig_parse_type(struct argconfig_commandline_options *s, struct option *option,
-				int index)
-{
-	void *value = (void *)(char *)s->default_value;
+	void *value = s->default_value;
 	char *endptr;
 	int ret = 0;
 
@@ -168,87 +157,67 @@ static int argconfig_parse_type(struct argconfig_commandline_options *s, struct 
 
 	switch (s->config_type) {
 	case CFG_STRING:
-		*((char **)value) = optarg;
-		break;
-	case CFG_SIZE:
-		*((size_t *)value) = strtol(optarg, &endptr, 0);
-		if (errno || optarg == endptr)
-			ret = argconfig_error("integer", option[index].name, optarg);
+		*(char **)value = optarg;
 		break;
 	case CFG_INT:
-		*((int *)value) = strtol(optarg, &endptr, 0);
+		*(int *)value = strtol(optarg, &endptr, 0);
 		if (errno || optarg == endptr)
-			ret = argconfig_error("integer", option[index].name, optarg);
+			ret = argconfig_error("integer", s->option, optarg);
 		break;
-	case CFG_BYTE:
-		ret = argconfig_parse_byte(option[index].name, optarg, (uint8_t *)value);
+	case CFG_BYTE: {
+		unsigned long tmp = strtoul(optarg, &endptr, 0);
+
+		if (errno || tmp >= 1 << 8 || optarg == endptr)
+			ret = argconfig_error("byte", s->option, optarg);
+		else
+			*(uint8_t *)value = tmp;
 		break;
+	}
 	case CFG_SHORT: {
 		unsigned long tmp = strtoul(optarg, &endptr, 0);
 
 		if (errno || tmp >= 1 << 16 || optarg == endptr)
-			ret = argconfig_error("short", option[index].name, optarg);
+			ret = argconfig_error("short", s->option, optarg);
 		else
-			*((uint16_t *)value) = tmp;
+			*(uint16_t *)value = tmp;
 		break;
 	}
 	case CFG_POSITIVE: {
 		uint32_t tmp = strtoul(optarg, &endptr, 0);
 
 		if (errno || optarg == endptr)
-			ret = argconfig_error("word", option[index].name, optarg);
+			ret = argconfig_error("word", s->option, optarg);
 		else
-			*((uint32_t *)value) = tmp;
+			*(uint32_t *)value = tmp;
 		break;
 	}
 	case CFG_INCREMENT:
-		*((int *)value) += 1;
+		*(int *)value += 1;
 		break;
 	case CFG_LONG:
-		*((unsigned long *)value) = strtoul(optarg, &endptr, 0);
+		*(unsigned long *)value = strtoul(optarg, &endptr, 0);
 		if (errno || optarg == endptr)
-			ret = argconfig_error("long integer", option[index].name, optarg);
+			ret = argconfig_error("long integer", s->option, optarg);
 		break;
 	case CFG_LONG_SUFFIX:
 		ret = suffix_binary_parse(optarg, &endptr, (uint64_t *)value);
 		if (ret)
-			argconfig_error("long suffixed integer", option[index].name, optarg);
+			argconfig_error("long suffixed integer", s->option, optarg);
 		break;
 	case CFG_DOUBLE:
-		*((double *)value) = strtod(optarg, &endptr);
+		*(double *)value = strtod(optarg, &endptr);
 		if (errno || optarg == endptr)
-			ret = argconfig_error("float", option[index].name, optarg);
+			ret = argconfig_error("float", s->option, optarg);
 		break;
 	case CFG_FLAG:
-		*((bool *)value) = true;
-		break;
-	default:
+		*(bool *)value = true;
 		break;
 	}
 
 	return ret;
 }
 
-static int argconfig_get_val_len(struct argconfig_opt_val *opt_val, const char *str)
-{
-	struct argconfig_opt_val *v;
-	int len;
-	int match;
-
-	for (len = 1; len <= strlen(str); len++) {
-		match = 0;
-		for (v = opt_val; v && v->str; v++) {
-			if (!strncasecmp(str, v->str, len))
-				match++;
-		}
-		if (match == 1)
-			break;
-	}
-
-	return len;
-}
-
-static int argconfig_set_opt_val(enum argconfig_types type, union argconfig_val *opt_val, void *val)
+static void argconfig_set_opt_val(enum argconfig_types type, union argconfig_val *opt_val, void *val)
 {
 	switch (type) {
 	case CFG_FLAG:
@@ -281,30 +250,39 @@ static int argconfig_set_opt_val(enum argconfig_types type, union argconfig_val 
 	case CFG_STRING:
 		*(char **)val = opt_val->string;
 		break;
-	default:
-		break;
 	}
-
-	return 0;
 }
 
-static int argconfig_parse_val(struct argconfig_commandline_options *s, struct option *option,
-			       int index)
+static struct argconfig_opt_val *
+argconfig_match_val(struct argconfig_opt_val *v, const char *str)
 {
-	const char *str = optarg;
-	void *val = s->default_value;
-	int len = strlen(optarg);
-	struct argconfig_opt_val *v;
-	int val_len;
+	size_t len = strlen(str);
+	struct argconfig_opt_val *match = NULL;
 
-	for (v = s->opt_val; v && v->str; v++) {
-		val_len = argconfig_get_val_len(s->opt_val, v->str);
-		if (strncasecmp(str, v->str, len > val_len ? len : val_len))
+	for (; v->str; v++) {
+		if (strncasecmp(str, v->str, len))
 			continue;
-		return argconfig_set_opt_val(v->type, &v->val, val);
+
+		if (match)
+			return NULL; /* multiple matches; input is ambiguous */
+
+		match = v;
 	}
 
-	return argconfig_parse_type(s, option, index);
+	return match;
+}
+
+static int argconfig_parse_val(struct argconfig_commandline_options *s)
+{
+	struct argconfig_opt_val *v = s->opt_val;
+
+	if (v)
+		v = argconfig_match_val(v, optarg);
+	if (!v)
+		return argconfig_parse_type(s);
+
+	argconfig_set_opt_val(v->type, &v->val, s->default_value);
+	return 0;
 }
 
 static bool argconfig_check_human_readable(struct argconfig_commandline_options *s)
@@ -320,8 +298,8 @@ static bool argconfig_check_human_readable(struct argconfig_commandline_options 
 int argconfig_parse(int argc, char *argv[], const char *program_desc,
 		    struct argconfig_commandline_options *options)
 {
-	char *short_opts;
-	struct option *long_opts;
+	_cleanup_free_ char *short_opts = NULL;
+	_cleanup_free_ struct option *long_opts = NULL;
 	struct argconfig_commandline_options *s;
 	int c, option_index = 0, short_index = 0, options_count = 0;
 	int ret = 0;
@@ -330,16 +308,15 @@ int argconfig_parse(int argc, char *argv[], const char *program_desc,
 	for (s = options; s->option; s++)
 		options_count++;
 
-	long_opts = calloc(1, sizeof(struct option) * (options_count + 3));
-	short_opts = calloc(1, sizeof(*short_opts) * (options_count * 3 + 5));
+	long_opts = calloc(options_count + 2, sizeof(struct option));
+	short_opts = calloc(options_count * 3 + 3, sizeof(*short_opts));
 
 	if (!long_opts || !short_opts) {
 		fprintf(stderr, "failed to allocate memory for opts: %s\n", strerror(errno));
-		ret = -errno;
-		goto out;
+		return -errno;
 	}
 
-	for (s = options; s->option && option_index < options_count; s++) {
+	for (s = options; s->option; s++) {
 		if (s->short_option) {
 			short_opts[short_index++] = s->short_option;
 			if (s->argument_type == required_argument ||
@@ -348,7 +325,7 @@ int argconfig_parse(int argc, char *argv[], const char *program_desc,
 			if (s->argument_type == optional_argument)
 				short_opts[short_index++] = ':';
 		}
-		if (s->option && strlen(s->option)) {
+		if (!is_null_or_empty(s->option)) {
 			long_opts[option_index].name = s->option;
 			long_opts[option_index].has_arg = s->argument_type;
 		}
@@ -384,10 +361,7 @@ int argconfig_parse(int argc, char *argv[], const char *program_desc,
 		if (!s->default_value)
 			continue;
 
-		if (s->opt_val)
-			ret = argconfig_parse_val(s, long_opts, option_index);
-		else
-			ret = argconfig_parse_type(s, long_opts, option_index);
+		ret = argconfig_parse_val(s);
 		if (ret)
 			break;
 	}
@@ -395,139 +369,12 @@ int argconfig_parse(int argc, char *argv[], const char *program_desc,
 	if (!argconfig_check_human_readable(options))
 		setlocale(LC_ALL, "C");
 
-out:
-	free(short_opts);
-	free(long_opts);
 	return ret;
 }
 
-int argconfig_parse_comma_sep_array(char *string, int *val, unsigned int max_length)
-{
-	int ret = 0;
-	unsigned long v;
-	char *tmp;
-	char *p;
-
-	if (!string || !strlen(string))
-		return 0;
-
-	tmp = strtok(string, ",");
-	if (!tmp)
-		return 0;
-
-	v = strtoul(tmp, &p, 0);
-	if (*p != 0)
-		return -1;
-	if (v > UINT_MAX) {
-		fprintf(stderr, "%s out of range\n", tmp);
-		return -1;
-	}
-	val[ret] = v;
-
-	ret++;
-	while (1) {
-		tmp = strtok(NULL, ",");
-
-		if (tmp == NULL)
-			return ret;
-
-		if (ret >= max_length)
-			return -1;
-
-		v = strtoul(tmp, &p, 0);
-		if (*p != 0)
-			return -1;
-		if (v > UINT_MAX) {
-			fprintf(stderr, "%s out of range\n", tmp);
-			return -1;
-		}
-		val[ret] = v;
-		ret++;
-	}
-}
-
-int argconfig_parse_comma_sep_array_short(char *string, unsigned short *val,
-					  unsigned int max_length)
-{
-	int ret = 0;
-	unsigned long v;
-	char *tmp;
-	char *p;
-
-	if (!string || !strlen(string))
-		return 0;
-
-	tmp = strtok(string, ",");
-	if (!tmp)
-		return 0;
-
-	v = strtoul(tmp, &p, 0);
-	if (*p != 0)
-		return -1;
-	if (v > UINT16_MAX) {
-		fprintf(stderr, "%s out of range\n", tmp);
-		return -1;
-	}
-	val[ret] = v;
-	ret++;
-
-	while (1) {
-		tmp = strtok(NULL, ",");
-		if (tmp == NULL)
-			return ret;
-
-		if (ret >= max_length)
-			return -1;
-
-		v = strtoul(tmp, &p, 0);
-		if (*p != 0)
-			return -1;
-		if (v > UINT16_MAX) {
-			fprintf(stderr, "%s out of range\n", tmp);
-			return -1;
-		}
-		val[ret] = v;
-		ret++;
-	}
-}
-
-int argconfig_parse_comma_sep_array_long(char *string, unsigned long long *val,
-					 unsigned int max_length)
-{
-	int ret = 0;
-	char *tmp;
-	char *p;
-
-	if (!string || !strlen(string))
-		return 0;
-
-	tmp = strtok(string, ",");
-	if (tmp == NULL)
-		return 0;
-
-	val[ret] = strtoll(tmp, &p, 0);
-	if (*p != 0)
-		return -1;
-	ret++;
-	while (1) {
-		tmp = strtok(NULL, ",");
-
-		if (tmp == NULL)
-			return ret;
-
-		if (ret >= max_length)
-			return -1;
-
-		val[ret] = strtoll(tmp, &p, 0);
-		if (*p != 0)
-			return -1;
-		ret++;
-	}
-}
-
-#define DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_UINT_FUNC(size)		\
-int argconfig_parse_comma_sep_array_u##size(char *string,		\
-					    __u##size *val,		\
+#define DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_FUNC(name, ret_t, ret_max) \
+int argconfig_parse_comma_sep_array ## name(char *string,		\
+					    ret_t *val,			\
 					    unsigned int max_length)	\
 {									\
 	int ret = 0;							\
@@ -535,43 +382,38 @@ int argconfig_parse_comma_sep_array_u##size(char *string,		\
 	char *tmp;							\
 	char *p;							\
 									\
-	if (!string || !strlen(string))				\
+	if (is_null_or_empty(string))					\
 		return 0;						\
 									\
 	tmp = strtok(string, ",");					\
-	if (!tmp)							\
-		return 0;						\
 									\
-	v = strtoumax(tmp, &p, 0);					\
-	if (*p != 0)							\
-		return -1;						\
-	if (v > UINT##size##_MAX) {					\
-		fprintf(stderr, "%s out of range\n", tmp);		\
-		return -1;						\
-	}								\
-	val[ret] = v;							\
-									\
-	ret++;								\
-	while (1) {							\
-		tmp = strtok(NULL, ",");				\
-									\
-		if (tmp == NULL)					\
-			return ret;					\
-									\
+	while (tmp) {							\
 		if (ret >= max_length)					\
 			return -1;					\
 									\
 		v = strtoumax(tmp, &p, 0);				\
 		if (*p != 0)						\
 			return -1;					\
-		if (v > UINT##size##_MAX) {				\
+		if (v > ret_max) {					\
 			fprintf(stderr, "%s out of range\n", tmp);	\
 			return -1;					\
 		}							\
 		val[ret] = v;						\
 		ret++;							\
+									\
+		tmp = strtok(NULL, ",");				\
 	}								\
+									\
+	return ret;							\
 }
+
+DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_FUNC(, int, UINT_MAX)
+DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_FUNC(_short, unsigned short, UINT16_MAX)
+DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_FUNC(_long, unsigned long long, ULLONG_MAX)
+
+#define DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_UINT_FUNC(size) \
+	DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_FUNC(_u ## size, __u ## size, \
+						    UINT ## size ## _MAX)
 
 DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_UINT_FUNC(16);
 DEFINE_ARGCONFIG_PARSE_COMMA_SEP_ARRAY_UINT_FUNC(32);

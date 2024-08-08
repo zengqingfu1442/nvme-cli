@@ -17,6 +17,13 @@ jobs:
       image: ghcr.io/igaw/linux-nvme/debian:latest
     steps:
      - uses: actions/checkout@v4
+       with:
+         fetch-depth: 0
+     - name: fixup permissions
+       env:
+         GITHUB_WORKSPACE: ${{ github.workspace }}
+       run: |
+         git config --global --add safe.directory "${GITHUB_WORKSPACE}"
      - name: build
        run: |
          scripts/build.sh appimage
@@ -36,11 +43,10 @@ jobs:
     needs: build-appimage
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'linux-nvme/nvme-cli' }}
     steps:
-      - name: Download artifact
-        uses: dawidd6/action-download-artifact@v6
+      - uses: actions/download-artifact@v4
         with:
-          workflow: ${{ github.event.workflow_run.workflow_id }}
-          workflow_conclusion: success
+          name: AppImage
+          path: AppImage
       - name: FTP Deployer
         uses: sand4rt/ftp-deployer@v1.8
         with:

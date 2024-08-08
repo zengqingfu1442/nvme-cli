@@ -11,7 +11,7 @@
 #if !defined(OCP_NVME) || defined(CMD_HEADER_MULTI_READ)
 #define OCP_NVME
 
-#define OCP_PLUGIN_VERSION   "1.17.0"
+#define OCP_PLUGIN_VERSION   "2.9.0"
 #include "cmd.h"
 
 PLUGIN(NAME("ocp", "OCP cloud SSD extensions", OCP_PLUGIN_VERSION),
@@ -36,6 +36,8 @@ PLUGIN(NAME("ocp", "OCP cloud SSD extensions", OCP_PLUGIN_VERSION),
 		ENTRY("set-dssd-async-event-config", "Set DSSD Async Event Config", set_dssd_async_event_config)
 		ENTRY("get-dssd-async-event-config", "Get DSSD Async Event Config", get_dssd_async_event_config)
 		ENTRY("tcg-configuration-log", "Retrieve TCG Configuration Log Page", ocp_tcg_configuration_log)
+		ENTRY("get-error-injection", "Return set of error injection", get_error_injection)
+		ENTRY("set-error-injection", "Inject error conditions", set_error_injection)
 	)
 );
 

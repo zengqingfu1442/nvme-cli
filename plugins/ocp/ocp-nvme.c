@@ -23,10 +23,12 @@
 #include "linux/types.h"
 #include "util/types.h"
 #include "nvme-print.h"
+#include "nvme-wrap.h"
 
 #include "ocp-smart-extended-log.h"
 #include "ocp-clear-features.h"
 #include "ocp-fw-activation-history.h"
+#include "ocp-telemetry-decode.h"
 
 #define CREATE_CMD
 #include "ocp-nvme.h"
@@ -112,6 +114,93 @@ struct __packed feature_latency_monitor {
 	__u8  reserved[4083];
 };
 
+struct erri_entry {
+	union {
+		__u8 flags;
+		struct {
+			__u8 enable:1;
+			__u8 single:1;
+			__u8 rsvd2:6;
+		};
+	};
+	__u8 rsvd1;
+	__le16 type;
+	union {
+		__u8 specific[28];
+		struct {
+			__le16 nrtdp;
+			__u8 rsvd4[26];
+		};
+	};
+};
+
+#define ERRI_ENTRIES_MAX 127
+
+enum erri_type {
+	ERRI_TYPE_CPU_CTRL_HANG = 1,
+	ERRI_TYPE_NAND_HANG,
+	ERRI_TYPE_PLP_DEFECT,
+	ERRI_TYPE_LOGICAL_FIRMWARE_ERROR,
+	ERRI_TYPE_DRAM_CORRUPT_CRIT,
+	ERRI_TYPE_DRAM_CORRUPT_NON_CRIT,
+	ERRI_TYPE_NAND_CORRUPT,
+	ERRI_TYPE_SRAM_CORRUPT,
+	ERRI_TYPE_HW_MALFUNCTION,
+	ERRI_TYPE_NO_MORE_NAND_SPARES,
+	ERRI_TYPE_INCOMPLETE_SHUTDOWN,
+};
+
+const char *erri_type_to_string(__le16 type)
+{
+	switch (type) {
+	case ERRI_TYPE_CPU_CTRL_HANG:
+		return "CPU/controller hang";
+	case ERRI_TYPE_NAND_HANG:
+		return "NAND hang";
+	case ERRI_TYPE_PLP_DEFECT:
+		return "PLP defect";
+	case ERRI_TYPE_LOGICAL_FIRMWARE_ERROR:
+		return "logical firmware error";
+	case ERRI_TYPE_DRAM_CORRUPT_CRIT:
+		return "DRAM corruption critical path";
+	case ERRI_TYPE_DRAM_CORRUPT_NON_CRIT:
+		return "DRAM corruption non-critical path";
+	case ERRI_TYPE_NAND_CORRUPT:
+		return "NAND corruption";
+	case ERRI_TYPE_SRAM_CORRUPT:
+		return "SRAM corruption";
+	case ERRI_TYPE_HW_MALFUNCTION:
+		return "HW malfunction";
+	case ERRI_TYPE_NO_MORE_NAND_SPARES:
+		return "no more NAND spares available";
+	case ERRI_TYPE_INCOMPLETE_SHUTDOWN:
+		return "incomplete shutdown";
+	default:
+		break;
+	}
+
+	return "unknown";
+}
+
+struct erri_get_cq_entry {
+	__u32 nume:7;
+	__u32 rsvd7:25;
+};
+
+struct erri_config {
+	char *file;
+	__u8 number;
+	__u16 type;
+	__u16 nrtdp;
+};
+
+static const char *sel = "[0-3]: current/default/saved/supported";
+static const char *no_uuid = "Skip UUID index search (UUID index not required for OCP 1.0)";
+const char *data = "Error injection data structure entries";
+const char *number = "Number of valid error injection data entries";
+static const char *type = "Error injection type";
+static const char *nrtdp = "Number of reads to trigger device panic";
+
 static int ocp_print_C3_log_normal(struct nvme_dev *dev,
 				   struct ssd_latency_monitor_log *log_data)
 {
@@ -140,7 +229,7 @@ static int ocp_print_C3_log_normal(struct nvme_dev *dev,
 	printf("  Active Threshold D                 %d ms\n",
 	       C3_ACTIVE_THRESHOLD_INCREMENT *
 	       le16_to_cpu(log_data->active_threshold_d+1));
-	printf("  Active Latency Configuration       0x%x \n",
+	printf("  Active Latency Configuration       0x%x\n",
 	       le16_to_cpu(log_data->active_latency_config));
 	printf("  Active Latency Minimum Window      %d ms\n",
 	       C3_MINIMUM_WINDOW_INCREMENT *
@@ -397,7 +486,7 @@ static void ocp_print_C3_log_json(struct ssd_latency_monitor_log *log_data)
 static int get_c3_log_page(struct nvme_dev *dev, char *format)
 {
 	struct ssd_latency_monitor_log *log_data;
-	enum nvme_print_flags fmt;
+	nvme_print_flags_t fmt;
 	int ret;
 	__u8 *data;
 	int i;
@@ -664,8 +753,8 @@ static const char *eol_plp_failure_mode_to_string(__u8 mode)
 	return "Reserved";
 }
 
-static int eol_plp_failure_mode_get(struct nvme_dev *dev, const __u32 nsid,
-				    const __u8 fid, __u8 sel)
+static int eol_plp_failure_mode_get(struct nvme_dev *dev, const __u32 nsid, const __u8 fid,
+				    __u8 sel, bool uuid)
 {
 	__u32 result;
 	int err;
@@ -683,6 +772,15 @@ static int eol_plp_failure_mode_get(struct nvme_dev *dev, const __u32 nsid,
 		.timeout	= NVME_DEFAULT_IOCTL_TIMEOUT,
 		.result		= &result,
 	};
+
+	if (uuid) {
+		/* OCP 2.0 requires UUID index support */
+		err = ocp_get_uuid_index(dev, &args.uuidx);
+		if (err || !args.uuidx) {
+			nvme_show_error("ERROR: No OCP UUID index found");
+			return err;
+		}
+	}
 
 	err = nvme_get_features(&args);
 	if (!err) {
@@ -715,7 +813,6 @@ static int eol_plp_failure_mode_set(struct nvme_dev *dev, const __u32 nsid,
 			return err;
 		}
 	}
-
 
 	struct nvme_set_features_args args = {
 		.args_size = sizeof(args),
@@ -756,7 +853,7 @@ static int eol_plp_failure_mode(int argc, char **argv, struct command *cmd,
 			   "No argument prints current mode.";
 	const char *mode = "[0-3]: default/rom/wtm/normal";
 	const char *save = "Specifies that the controller shall save the attribute";
-	const char *sel = "[0-3,8]: current/default/saved/supported/changed";
+	const char *sel = "[0-3]: current/default/saved/supported";
 	const __u32 nsid = 0;
 	const __u8 fid = 0xc2;
 	struct nvme_dev *dev;
@@ -774,14 +871,12 @@ static int eol_plp_failure_mode(int argc, char **argv, struct command *cmd,
 		.sel = 0,
 	};
 
-	OPT_ARGS(opts) = {
-		OPT_BYTE("mode", 'm', &cfg.mode, mode),
-		OPT_FLAG("save", 's', &cfg.save, save),
-		OPT_BYTE("sel", 'S', &cfg.sel, sel),
-		OPT_FLAG("no-uuid", 'n', NULL,
-			 "Skip UUID index search (UUID index not required for OCP 1.0)"),
-		OPT_END()
-	};
+	NVME_ARGS(opts,
+		  OPT_BYTE("mode", 'm', &cfg.mode, mode),
+		  OPT_FLAG("save", 's', &cfg.save, save),
+		  OPT_BYTE("sel", 'S', &cfg.sel, sel),
+		  OPT_FLAG("no-uuid", 'n', NULL,
+			   "Skip UUID index search (UUID index not required for OCP 1.0)"));
 
 	err = parse_and_open(&dev, argc, argv, desc, opts);
 	if (err)
@@ -792,7 +887,8 @@ static int eol_plp_failure_mode(int argc, char **argv, struct command *cmd,
 					       cfg.save,
 					       !argconfig_parse_seen(opts, "no-uuid"));
 	else
-		err = eol_plp_failure_mode_get(dev, nsid, fid, cfg.sel);
+		err = eol_plp_failure_mode_get(dev, nsid, fid, cfg.sel,
+					       !argconfig_parse_seen(opts, "no-uuid"));
 
 	dev_close(dev);
 
@@ -804,58 +900,15 @@ static int eol_plp_failure_mode(int argc, char **argv, struct command *cmd,
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
 /// Telemetry Log
+//global buffers
+static __le64 total_log_page_sz;
+static __u8 *header_data;
+static struct telemetry_str_log_format *log_data;
 
-#define TELEMETRY_HEADER_SIZE 512
-#define TELEMETRY_BYTE_PER_BLOCK 512
-#define TELEMETRY_TRANSFER_SIZE 1024
-#define FILE_NAME_SIZE 2048
+__u8 *ptelemetry_buffer;
+__u8 *pstring_buffer;
+__u8 *pC9_string_buffer;
 
-enum TELEMETRY_TYPE {
-	TELEMETRY_TYPE_NONE       = 0,
-	TELEMETRY_TYPE_HOST       = 7,
-	TELEMETRY_TYPE_CONTROLLER = 8,
-	TELEMETRY_TYPE_HOST_0     = 9,
-	TELEMETRY_TYPE_HOST_1     = 10,
-};
-
-struct telemetry_initiated_log {
-	__u8  LogIdentifier;
-	__u8  Reserved1[4];
-	__u8  IEEE[3];
-	__le16 DataArea1LastBlock;
-	__le16 DataArea2LastBlock;
-	__le16 DataArea3LastBlock;
-	__u8  Reserved2[368];
-	__u8  DataAvailable;
-	__u8  DataGenerationNumber;
-	__u8  ReasonIdentifier[128];
-};
-
-struct telemetry_data_area_1 {
-	__le16 major_version;
-	__le16 minor_version;
-	__u8  reserved1[4];
-	__le64	timestamp;
-	__u8    log_page_guid[16];
-	__u8    no_of_tps_supp;
-	__u8    tps;
-	__u8  reserved2[6];
-	__le16  sls;
-	__u8  reserved3[8];
-	__le16 fw_revision;
-	__u8  reserved4[32];
-	__le16  da1_stat_start;
-	__le16  da1_stat_size;
-	__le16  da2_stat_start;
-	__le16  da2_stat_size;
-	__u8  reserved5[32];
-	__u8    event_fifo_da[16];
-	__le64	event_fifo_start[16];
-	__le64	event_fifo_size[16];
-	__u8  reserved6[80];
-	__u8  smart_health_info[512];
-	__u8  smart_health_info_extended[512];
-};
 static void get_serial_number(struct nvme_id_ctrl *ctrl, char *sn)
 {
 	int i;
@@ -867,39 +920,20 @@ static void get_serial_number(struct nvme_id_ctrl *ctrl, char *sn)
 	}
 }
 
-static int get_telemetry_header(struct nvme_dev *dev, __u32 ns, __u8 tele_type,
-				__u32 data_len, void *data, __u8 nLSP, __u8 nRAE)
-{
-	struct nvme_passthru_cmd cmd = {
-		.opcode = nvme_admin_get_log_page,
-		.nsid = ns,
-		.addr = (__u64)(uintptr_t) data,
-		.data_len = data_len,
-	};
-
-	__u32 numd = (data_len >> 2) - 1;
-	__u16 numdu = numd >> 16;
-	__u16 numdl = numd & 0xffff;
-
-	cmd.cdw10 = tele_type | (nLSP & 0x0F) << 8 | (nRAE & 0x01) << 15 | (numdl & 0xFFFF) << 16;
-	cmd.cdw11 = numdu;
-	cmd.cdw12 = 0;
-	cmd.cdw13 = 0;
-	cmd.cdw14 = 0;
-
-	return nvme_submit_admin_passthru(dev_fd(dev), &cmd, NULL);
-}
-
 static void print_telemetry_header(struct telemetry_initiated_log *logheader,
 		int tele_type)
 {
 	if (logheader) {
 		unsigned int i = 0, j = 0;
+		__u8 dataGenNum;
 
-		if (tele_type == TELEMETRY_TYPE_HOST)
+		if (tele_type == TELEMETRY_TYPE_HOST) {
 			printf("============ Telemetry Host Header ============\n");
-		else
+			dataGenNum = logheader->DataHostGenerationNumber;
+		} else {
 			printf("========= Telemetry Controller Header =========\n");
+			dataGenNum = logheader->DataCtlrGenerationNumber;
+		}
 
 		printf("Log Identifier         : 0x%02X\n", logheader->LogIdentifier);
 		printf("IEEE                   : 0x%02X%02X%02X\n",
@@ -910,8 +944,10 @@ static void print_telemetry_header(struct telemetry_initiated_log *logheader,
 			le16_to_cpu(logheader->DataArea2LastBlock));
 		printf("Data Area 3 Last Block : 0x%04X\n",
 			le16_to_cpu(logheader->DataArea3LastBlock));
-		printf("Data Available         : 0x%02X\n",	logheader->DataAvailable);
-		printf("Data Generation Number : 0x%02X\n",	logheader->DataGenerationNumber);
+		printf("Data Available         : 0x%02X\n",
+			logheader->CtlrDataAvailable);
+		printf("Data Generation Number : 0x%02X\n",
+			dataGenNum);
 		printf("Reason Identifier      :\n");
 
 		for (i = 0; i < 8; i++) {
@@ -922,6 +958,7 @@ static void print_telemetry_header(struct telemetry_initiated_log *logheader,
 		printf("===============================================\n\n");
 	}
 }
+
 static int get_telemetry_data(struct nvme_dev *dev, __u32 ns, __u8 tele_type,
 							  __u32 data_len, void *data, __u8 nLSP, __u8 nRAE,
 							  __u64 offset)
@@ -935,10 +972,14 @@ static int get_telemetry_data(struct nvme_dev *dev, __u32 ns, __u8 tele_type,
 	__u32 numd = (data_len >> 2) - 1;
 	__u16 numdu = numd >> 16;
 	__u16 numdl = numd & 0xffff;
-	cmd.cdw10 = tele_type | (nLSP & 0x0F) << 8 | (nRAE & 0x01) << 15 | (numdl & 0xFFFF) << 16;
+
+	cmd.cdw10 = tele_type |
+			(nLSP & 0x0F) << 8 |
+			(nRAE & 0x01) << 15 |
+			(numdl & 0xFFFF) << 16;
 	cmd.cdw11 = numdu;
-	cmd.cdw12 = offset;
-	cmd.cdw13 = 0;
+	cmd.cdw12 = (__u32)(0x00000000FFFFFFFF & offset);
+	cmd.cdw13 = (__u32)((0xFFFFFFFF00000000 & offset) >> 8);
 	cmd.cdw14 = 0;
 	return nvme_submit_admin_passthru(dev_fd(dev), &cmd, NULL);
 }
@@ -947,120 +988,116 @@ static void print_telemetry_data_area_1(struct telemetry_data_area_1 *da1,
 {
 	if (da1) {
 		int i = 0;
+
 		if (tele_type == TELEMETRY_TYPE_HOST)
 			printf("============ Telemetry Host Data area 1 ============\n");
 		else
 			printf("========= Telemetry Controller Data area 1 =========\n");
-		printf("Major Version         : 0x%x\n", le16_to_cpu(da1->major_version));
-		printf("Minor Version         : 0x%x\n", le16_to_cpu(da1->minor_version));
-		for (i = 0; i < 4; i++)
-			printf("reserved1         : 0x%x\n", da1->reserved1[i]);
+		printf("Major Version     : 0x%x\n", le16_to_cpu(da1->major_version));
+		printf("Minor Version     : 0x%x\n", le16_to_cpu(da1->minor_version));
 		printf("Timestamp         : %"PRIu64"\n", le64_to_cpu(da1->timestamp));
-		for (i = 15; i >= 0; i--)
-			printf("%x", da1->log_page_guid[i]);
-		printf("Number Telemetry Profiles Supported         : 0x%x\n", da1->no_of_tps_supp);
-		printf("Telemetry Profile Selected (TPS)         : 0x%x\n", da1->tps);
-		for (i = 0; i < 6; i++)
-			printf("reserved2         : 0x%x\n", da1->reserved2[i]);
-		printf("Telemetry String Log Size (SLS)         : 0x%x\n", le16_to_cpu(da1->sls));
+		printf("Log Page GUID     : 0x");
+		for (int j = 15; j >= 0; j--)
+			printf("%02x", da1->log_page_guid[j]);
+		printf("\n");
+		printf("Number Telemetry Profiles Supported   : 0x%x\n",
+				da1->no_of_tps_supp);
+		printf("Telemetry Profile Selected (TPS)      : 0x%x\n",
+				da1->tps);
+		printf("Telemetry String Log Size (SLS)       : 0x%lx\n",
+				le64_to_cpu(da1->sls));
+		printf("Firmware Revision                     : ");
 		for (i = 0; i < 8; i++)
-			printf("reserved3         : 0x%x\n", da1->reserved3[i]);
-		printf("Firmware Revision         : 0x%x\n", le16_to_cpu(da1->fw_revision));
-		for (i = 0; i < 32; i++)
-			printf("reserved4         : 0x%x\n", da1->reserved4[i]);
-		printf("Data Area 1 Statistic Start         : 0x%x\n", le16_to_cpu(da1->da1_stat_start));
-		printf("Data Area 1 Statistic Size         : 0x%x\n", le16_to_cpu(da1->da1_stat_size));
-		printf("Data Area 2 Statistic Start         : 0x%x\n", le16_to_cpu(da1->da2_stat_start));
-		printf("Data Area 2 Statistic Size         : 0x%x\n", le16_to_cpu(da1->da2_stat_size));
-		for (i = 0; i < 32; i++)
-			printf("reserved5         : 0x%x\n", da1->reserved5[i]);
+			printf("%c", (char)da1->fw_revision[i]);
+		printf("\n");
+		printf("Data Area 1 Statistic Start           : 0x%lx\n",
+				le64_to_cpu(da1->da1_stat_start));
+		printf("Data Area 1 Statistic Size            : 0x%lx\n",
+				le64_to_cpu(da1->da1_stat_size));
+		printf("Data Area 2 Statistic Start           : 0x%lx\n",
+				le64_to_cpu(da1->da2_stat_start));
+		printf("Data Area 2 Statistic Size            : 0x%lx\n",
+				le64_to_cpu(da1->da2_stat_size));
 		for (i = 0; i < 16; i++) {
-			printf("Event FIFO %d Data Area         : 0x%x\n", i, da1->event_fifo_da[i]);
-			printf("Event FIFO %d Start         : %"PRIu64"\n", i, le64_to_cpu(da1->event_fifo_start[i]));
-			printf("Event FIFO %d Size         : %"PRIu64"\n", i, le64_to_cpu(da1->event_fifo_size[i]));
+			printf("Event FIFO %d Data Area                : 0x%x\n",
+					i, da1->event_fifo_da[i]);
+			printf("Event FIFO %d Start                    : 0x%"PRIx64"\n",
+					i, le64_to_cpu(da1->event_fifos[i].start));
+			printf("Event FIFO %d Size                     : 0x%"PRIx64"\n",
+					i, le64_to_cpu(da1->event_fifos[i].size));
 		}
-		for (i = 0; i < 80; i++)
-			printf("reserved6         : 0x%x\n", da1->reserved6[i]);
-		for (i = 0; i < 512; i++){
-			printf("SMART / Health Information         : 0x%x\n", da1->smart_health_info[i]);
-			printf("SMART / Health Information Extended         : 0x%x\n", da1->smart_health_info_extended[i]);
-		}
-		printf("===============================================\n\n");
-	}
-}
-static void print_telemetry_da1_stat(__u8 *da1_stat, int tele_type, __u16 buf_size)
-{
-	if (da1_stat) {
-		unsigned int i = 0;
-		if (tele_type == TELEMETRY_TYPE_HOST)
-			printf("============ Telemetry Host Data area 1 Statistics ============\n");
-		else
-			printf("========= Telemetry Controller Data area 1 Statistics =========\n");
-		while((i + 8) < buf_size) {
-			printf("Statistics Identifier         : 0x%x\n", (da1_stat[i] | da1_stat[i+1] << 8));
-			printf("Statistics info         : 0x%x\n", da1_stat[i+2]);
-			printf("NS info         : 0x%x\n", da1_stat[i+3]);
-			printf("Statistic Data Size         : 0x%x\n", (da1_stat[i+4] | da1_stat[i+5] << 8));
-			printf("Reserved         : 0x%x\n", (da1_stat[i+6] | da1_stat[i+7] << 8));
-			i = 8 + ((da1_stat[i+4] | da1_stat[i+5] << 8) * 4);
-		}
-		printf("===============================================\n\n");
-	}
-}
-static void print_telemetry_da1_fifo(__u8 *da1_fifo, int tele_type, __u16 buf_size)
-{
-	if (da1_fifo) {
-		unsigned int i = 0;
-		if (tele_type == TELEMETRY_TYPE_HOST)
-			printf("============ Telemetry Host Data area 1 FIFO ============\n");
-		else
-			printf("========= Telemetry Controller Data area 1 FIFO =========\n");
-		while((i + 4) < buf_size) {
-			printf("Debug Event Class Type         : 0x%x\n", da1_fifo[i]);
-			printf("Event ID         : 0x%x\n", (da1_fifo[i+1] | da1_fifo[i+2] << 8));
-			printf("Event Data Size         : 0x%x\n", da1_fifo[3]);
-			i = 4 + ((da1_fifo[3]) * 4);
-		}
-		printf("===============================================\n\n");
-	}
-}
-static void print_telemetry_da2_stat(__u8 *da1_stat, int tele_type, __u16 buf_size)
-{
-	if (da1_stat) {
-		unsigned int i = 0;
-		if (tele_type == TELEMETRY_TYPE_HOST)
-			printf("============ Telemetry Host Data area 1 Statistics ============\n");
-		else
-			printf("========= Telemetry Controller Data area 1 Statistics =========\n");
-		while((i + 8) < buf_size) {
-			printf("Statistics Identifier         : 0x%x\n", (da1_stat[i] | da1_stat[i+1] << 8));
-			printf("Statistics info         : 0x%x\n", da1_stat[i+2]);
-			printf("NS info         : 0x%x\n", da1_stat[i+3]);
-			printf("Statistic Data Size         : 0x%x\n", (da1_stat[i+4] | da1_stat[i+5] << 8));
-			printf("Reserved         : 0x%x\n", (da1_stat[i+6] | da1_stat[i+7] << 8));
-			i = 8 + ((da1_stat[i+4] | da1_stat[i+5] << 8) * 4);
-		}
-		printf("===============================================\n\n");
-	}
-}
-static void print_telemetry_da2_fifo(__u8 *da1_fifo, int tele_type, __u16 buf_size)
-{
-	if (da1_fifo) {
-		unsigned int i = 0;
-		if (tele_type == TELEMETRY_TYPE_HOST)
-			printf("============ Telemetry Host Data area 1 Statistics ============\n");
-		else
-			printf("========= Telemetry Controller Data area 1 Statistics =========\n");
-		while((i + 4) < buf_size) {
-			printf("Debug Event Class Type         : 0x%x\n", da1_fifo[i]);
-			printf("Event ID         : 0x%x\n", (da1_fifo[i+1] | da1_fifo[i+2] << 8));
-			printf("Event Data Size         : 0x%x\n", da1_fifo[3]);
-			i = 4 + ((da1_fifo[3]) * 4);
-		}
-		printf("===============================================\n\n");
-	}
-}
+		printf("SMART / Health Information     :\n");
+		printf("0x");
+		for (i = 0; i < 512; i++)
+			printf("%02x", da1->smart_health_info[i]);
+		printf("\n");
 
+		printf("SMART / Health Information Extended     :\n");
+		printf("0x");
+		for (i = 0; i < 512; i++)
+			printf("%02x", da1->smart_health_info_extended[i]);
+		printf("\n");
+
+		printf("===============================================\n\n");
+	}
+}
+static void print_telemetry_da_stat(struct telemetry_stats_desc *da_stat,
+		int tele_type,
+		__u16 buf_size,
+		__u8 data_area)
+{
+	if (da_stat) {
+		unsigned int i = 0;
+		struct telemetry_stats_desc *next_da_stat = da_stat;
+
+		if (tele_type == TELEMETRY_TYPE_HOST)
+			printf("============ Telemetry Host Data Area %d Statistics ============\n",
+				data_area);
+		else
+			printf("========= Telemetry Controller Data Area %d Statistics =========\n",
+				data_area);
+		while ((i + 8) < buf_size) {
+			print_stats_desc(next_da_stat);
+			i += 8 + ((next_da_stat->size) * 4);
+			next_da_stat = (struct telemetry_stats_desc *)((__u64)da_stat + i);
+
+			if ((next_da_stat->id == 0) && (next_da_stat->size == 0))
+				break;
+		}
+		printf("===============================================\n\n");
+	}
+}
+static void print_telemetry_da_fifo(struct telemetry_event_desc *da_fifo,
+		__le64 buf_size,
+		int tele_type,
+		int da,
+		int index)
+{
+	if (da_fifo) {
+		unsigned int i = 0;
+		struct telemetry_event_desc *next_da_fifo = da_fifo;
+
+		if (tele_type == TELEMETRY_TYPE_HOST)
+			printf("========= Telemetry Host Data area %d Event FIFO %d =========\n",
+				da, index);
+		else
+			printf("====== Telemetry Controller Data area %d Event FIFO %d ======\n",
+				da, index);
+
+
+		while ((i + 4) < buf_size) {
+			/* Print Event Data */
+			print_telemetry_fifo_event(next_da_fifo->class, /* Event class type */
+				next_da_fifo->id,                           /* Event ID         */
+				next_da_fifo->size,                         /* Event data size  */
+				(__u8 *)&next_da_fifo->data);               /* Event data       */
+
+			i += (4 + (next_da_fifo->size * 4));
+			next_da_fifo = (struct telemetry_event_desc *)((__u64)da_fifo + i);
+		}
+		printf("===============================================\n\n");
+	}
+}
 static int extract_dump_get_log(struct nvme_dev *dev, char *featurename, char *filename, char *sn,
 				int dumpsize, int transfersize, __u32 nsid, __u8 log_id,
 				__u8 lsp, __u64 offset, bool rae)
@@ -1146,10 +1183,12 @@ static int get_telemetry_dump(struct nvme_dev *dev, char *filename, char *sn,
 			      enum TELEMETRY_TYPE tele_type, int data_area, bool header_print)
 {
 	__u32 err = 0, nsid = 0;
-	__u8 lsp = 0, rae = 0;
+	__le64 da1_sz = 512, m_512_sz = 0, da1_off = 0, m_512_off = 0, diff = 0,
+		temp_sz = 0, temp_ofst = 0;
+	__u8 lsp = 0, rae = 0, flag = 0;
+	__u8 data[TELEMETRY_HEADER_SIZE] = { 0 };
 	unsigned int i = 0;
-	char data[TELEMETRY_TRANSFER_SIZE] = { 0 };
-	char data1[1536] = { 0 };
+	char data1[TELEMETRY_DATA_SIZE] = { 0 };
 	char *featurename = 0;
 	struct telemetry_initiated_log *logheader = (struct telemetry_initiated_log *)data;
 	struct telemetry_data_area_1 *da1 = (struct telemetry_data_area_1 *)data1;
@@ -1172,50 +1211,244 @@ static int get_telemetry_dump(struct nvme_dev *dev, char *filename, char *sn,
 		rae = 1;
 	}
 
-	err = get_telemetry_header(dev, nsid, tele_type, TELEMETRY_HEADER_SIZE,
-				(void *)data, lsp, rae);
-	if (err)
+	/* Get the telemetry header */
+	err = get_telemetry_data(dev, nsid, tele_type, TELEMETRY_HEADER_SIZE,
+				(void *)data, lsp, rae, 0);
+	if (err) {
+		printf("get_telemetry_header failed, err: %d.\n", err);
 		return err;
+	}
 
 	if (header_print)
 		print_telemetry_header(logheader, tele_type);
-	err = get_telemetry_data(dev, nsid, tele_type, 1536,
+
+	/* Get the telemetry data */
+	err = get_telemetry_data(dev, nsid, tele_type, TELEMETRY_DATA_SIZE,
 				(void *)data1, lsp, rae, 512);
-	if (err)
+	if (err) {
+		printf("get_telemetry_data failed for type: 0x%x, err: %d.\n", tele_type, err);
 		return err;
+	}
+
 	print_telemetry_data_area_1(da1, tele_type);
-	char *da1_stat = calloc((da1->da1_stat_size * 4), sizeof(char));
-	err = get_telemetry_data(dev, nsid, tele_type, (da1->da1_stat_size) * 4,
-				(void *)da1_stat, lsp, rae, (da1->da1_stat_start) * 4);
-	if (err)
-		return err;
-	print_telemetry_da1_stat((void *)da1_stat, tele_type, (da1->da1_stat_size) * 4);
-	for (i = 0; i < 17 ; i++){
-		if (da1->event_fifo_da[i] == 1){
-			char *da1_fifo = calloc((da1->event_fifo_size[i]) * 4, sizeof(char));
-			err = get_telemetry_data(dev, nsid, tele_type, (da1->event_fifo_size[i]) * 4,
-				(void *)da1_stat, lsp, rae, (da1->event_fifo_start[i]) * 4);
-			if (err)
+
+	/* Print the Data Area 1 Stats */
+	if (da1->da1_stat_size != 0) {
+		diff = 0;
+		da1_sz = (da1->da1_stat_size) * 4;
+		m_512_sz = (da1->da1_stat_size) * 4;
+		da1_off = (da1->da1_stat_start) * 4;
+		m_512_off = (da1->da1_stat_start) * 4;
+		temp_sz = (da1->da1_stat_size) * 4;
+		temp_ofst = (da1->da1_stat_start) * 4;
+		flag = 0;
+
+		if ((da1_off % 512) > 0) {
+			m_512_off = (__le64) ((da1_off / 512));
+			da1_off = m_512_off * 512;
+			diff = temp_ofst - da1_off;
+			flag = 1;
+		}
+
+		if (da1_sz < 512)
+			da1_sz = 512;
+		else if ((da1_sz % 512) > 0) {
+			if (flag == 0) {
+				m_512_sz = (__le64) ((da1_sz / 512) + 1);
+				da1_sz = m_512_sz * 512;
+			} else {
+				if (diff < 512)
+					diff = 1;
+				else
+					diff = (diff / 512) * 512;
+
+				m_512_sz = (__le64) ((da1_sz / 512) + 1 + diff + 1);
+				da1_sz = m_512_sz * 512;
+			}
+		}
+
+		char *da1_stat = calloc(da1_sz, sizeof(char));
+
+		err = get_telemetry_data(dev, nsid, tele_type, da1_sz,
+				(void *)da1_stat, lsp, rae, da1_off);
+		if (err) {
+			printf("get_telemetry_data da1 stats failed, err: %d.\n", err);
+			return err;
+		}
+
+		print_telemetry_da_stat((void *)(da1_stat + (temp_ofst - da1_off)),
+				tele_type, (da1->da1_stat_size) * 4, 1);
+	}
+
+	/* Print the Data Area 1 Event FIFO's */
+	for (i = 0; i < 16 ; i++) {
+		if ((da1->event_fifo_da[i] == 1) && (da1->event_fifos[i].size != 0)) {
+			diff = 0;
+			da1_sz = da1->event_fifos[i].size * 4;
+			m_512_sz = da1->event_fifos[i].size * 4;
+			da1_off = da1->event_fifos[i].start * 4;
+			m_512_off = da1->event_fifos[i].start * 4;
+			temp_sz = da1->event_fifos[i].size * 4;
+			temp_ofst = da1->event_fifos[i].start * 4;
+			flag = 0;
+
+			if ((da1_off % 512) > 0) {
+				m_512_off = (__le64) ((da1_off / 512));
+				da1_off = m_512_off * 512;
+				diff = temp_ofst - da1_off;
+				flag = 1;
+			}
+
+			if (da1_sz < 512)
+				da1_sz = 512;
+			else if ((da1_sz % 512) > 0) {
+				if (flag == 0) {
+					m_512_sz = (__le64) ((da1_sz / 512) + 1);
+					da1_sz = m_512_sz * 512;
+				} else {
+					if (diff < 512)
+						diff = 1;
+					else
+						diff = (diff / 512) * 512;
+
+					m_512_sz = (__le64) ((da1_sz / 512) + 1 + diff + 1);
+					da1_sz = m_512_sz * 512;
+				}
+			}
+
+			char *da1_fifo = calloc(da1_sz, sizeof(char));
+
+			err = get_telemetry_data(dev, nsid, tele_type,
+					(da1->event_fifos[i].size) * 4,
+					(void *)da1_fifo, lsp, rae, da1_off);
+			if (err) {
+				printf("get_telemetry_data da1 event fifos failed, err: %d.\n",
+					err);
 				return err;
-			print_telemetry_da1_fifo((void *)da1_fifo, tele_type, (da1->event_fifo_size[i]) * 4);
+			}
+			print_telemetry_da_fifo((void *)(da1_fifo + (temp_ofst - da1_off)),
+					temp_sz,
+					tele_type,
+					da1->event_fifo_da[i],
+					i);
 		}
 	}
-	char *da2_stat = calloc((da1->da2_stat_size * 4), sizeof(char));
-	err = get_telemetry_data(dev, nsid, tele_type, (da1->da2_stat_size) * 4,
-				(void *)da2_stat, lsp, rae, (da1->da2_stat_start) * 4);
-	if (err)
-		return err;
-	print_telemetry_da2_stat((void *)da2_stat, tele_type, (da1->da2_stat_size) * 4);
-	for (i = 0; i < 17 ; i++){
-		if (da1->event_fifo_da[i] == 2){
-			char *da1_fifo = calloc((da1->event_fifo_size[i]) * 4, sizeof(char));
-			err = get_telemetry_data(dev, nsid, tele_type, (da1->event_fifo_size[i]) * 4,
-				(void *)da1_stat, lsp, rae, (da1->event_fifo_start[i]) * 4);
-			if (err)
+
+	/* Print the Data Area 2 Stats */
+	if (da1->da2_stat_size != 0) {
+		da1_off = (da1->da2_stat_start) * 4;
+		temp_ofst = (da1->da2_stat_start) * 4;
+		da1_sz = (da1->da2_stat_size) * 4;
+		diff = 0;
+		flag = 0;
+
+		if (da1->da2_stat_start == 0) {
+			da1_off = 512 + (logheader->DataArea1LastBlock * 512);
+			temp_ofst = 512 + (le16_to_cpu(logheader->DataArea1LastBlock) * 512);
+			if ((da1_off % 512) == 0) {
+				m_512_off = (__le64) (((da1_off) / 512));
+				da1_off = m_512_off * 512;
+				diff = temp_ofst - da1_off;
+				flag = 1;
+			}
+		} else {
+
+			if (((da1_off * 4) % 512) > 0) {
+				m_512_off = (__le64) ((((da1->da2_stat_start) * 4) / 512));
+				da1_off = m_512_off * 512;
+				diff = ((da1->da2_stat_start) * 4) - da1_off;
+				flag = 1;
+			}
+		}
+
+		if (da1_sz < 512)
+			da1_sz = 512;
+		else if ((da1_sz % 512) > 0) {
+			if (flag == 0) {
+				m_512_sz = (__le64) ((da1->da2_stat_size / 512) + 1);
+				da1_sz = m_512_sz * 512;
+			} else {
+				if (diff < 512)
+					diff = 1;
+				else
+					diff = (diff / 512) * 512;
+				m_512_sz = (__le64) ((da1->da2_stat_size / 512) + 1 + diff + 1);
+				da1_sz = m_512_sz * 512;
+			}
+		}
+
+		char *da2_stat = calloc(da1_sz, sizeof(char));
+
+		err = get_telemetry_data(dev, nsid, tele_type, da1_sz,
+				(void *)da2_stat, lsp, rae, da1_off);
+		if (err) {
+			printf("get_telemetry_data da2 stats failed, err: %d.\n", err);
+			return err;
+		}
+
+		print_telemetry_da_stat((void *)(da2_stat + (temp_ofst - da1_off)),
+			tele_type,
+			(da1->da2_stat_size) * 4,
+			2);
+	}
+
+	/* Print the Data Area 2 Event FIFO's */
+	for (i = 0; i < 16 ; i++) {
+		if ((da1->event_fifo_da[i] == 2) && (da1->event_fifos[i].size != 0)) {
+			diff = 0;
+			da1_sz = da1->event_fifos[i].size * 4;
+			m_512_sz = da1->event_fifos[i].size * 4;
+			da1_off = da1->event_fifos[i].start * 4;
+			m_512_off = da1->event_fifos[i].start * 4;
+			temp_sz = da1->event_fifos[i].size * 4;
+			temp_ofst = da1->event_fifos[i].start * 4;
+			flag = 0;
+
+			if ((da1_off % 512) > 0) {
+				m_512_off = (__le64) ((da1_off / 512));
+				da1_off = m_512_off * 512;
+				diff = temp_ofst - da1_off;
+				flag = 1;
+			}
+
+			if (da1_sz < 512)
+				da1_sz = 512;
+			else if ((da1_sz % 512) > 0) {
+				if (flag == 0) {
+					m_512_sz = (__le64) ((da1_sz / 512) + 1);
+					da1_sz = m_512_sz * 512;
+				}
+
+				else {
+					if (diff < 512)
+						diff = 1;
+					else
+						diff = (diff / 512) * 512;
+
+					m_512_sz = (__le64) ((da1_sz / 512) + 1 + diff + 1);
+					da1_sz = m_512_sz * 512;
+				}
+			}
+
+			char *da1_fifo = calloc(da1_sz, sizeof(char));
+
+			err = get_telemetry_data(dev, nsid, tele_type,
+					(da1->event_fifos[i].size) * 4,
+					(void *)da1_fifo, lsp, rae, da1_off);
+			if (err) {
+				printf("get_telemetry_data da2 event fifos failed, err: %d.\n",
+					err);
 				return err;
-			print_telemetry_da2_fifo((void *)da1_fifo, tele_type, (da1->event_fifo_size[i]) * 4);
+			}
+			print_telemetry_da_fifo((void *)(da1_fifo + (temp_ofst - da1_off)),
+					temp_sz,
+					tele_type,
+					da1->event_fifo_da[i],
+					i);
 		}
 	}
+
+	printf("------------------------------FIFO End---------------------------\n");
 
 	switch (data_area) {
 	case 1:
@@ -1252,43 +1485,283 @@ static int get_telemetry_dump(struct nvme_dev *dev, char *filename, char *sn,
 	return err;
 }
 
+static int get_telemetry_log_page_data(struct nvme_dev *dev, int tele_type)
+{
+	char file_path[PATH_MAX];
+	void *telemetry_log;
+	const size_t bs = 512;
+	struct nvme_telemetry_log *hdr;
+	size_t full_size, offset = bs;
+	int err, fd;
+
+	if ((tele_type == TELEMETRY_TYPE_HOST_0) || (tele_type == TELEMETRY_TYPE_HOST_1))
+		tele_type = TELEMETRY_TYPE_HOST;
+
+	int log_id = (tele_type == TELEMETRY_TYPE_HOST ? NVME_LOG_LID_TELEMETRY_HOST :
+			NVME_LOG_LID_TELEMETRY_CTRL);
+
+	hdr = malloc(bs);
+	telemetry_log = malloc(bs);
+	if (!hdr || !telemetry_log) {
+		fprintf(stderr, "Failed to allocate %zu bytes for log: %s\n",
+			bs, strerror(errno));
+		err = -ENOMEM;
+		goto exit_status;
+	}
+	memset(hdr, 0, bs);
+
+	sprintf(file_path, DEFAULT_TELEMETRY_BIN);
+	fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open output file %s: %s!\n",
+			file_path, strerror(errno));
+		err = fd;
+		goto exit_status;
+	}
+
+	struct nvme_get_log_args args = {
+		.lpo = 0,
+		.result = NULL,
+		.log = hdr,
+		.args_size = sizeof(args),
+		.fd = dev_fd(dev),
+		.timeout = NVME_DEFAULT_IOCTL_TIMEOUT,
+		.lid = log_id,
+		.len = bs,
+		.nsid = NVME_NSID_ALL,
+		.csi = NVME_CSI_NVM,
+		.lsi = NVME_LOG_LSI_NONE,
+		.lsp = NVME_LOG_TELEM_HOST_LSP_CREATE,
+		.uuidx = NVME_UUID_NONE,
+		.rae = true,
+		.ot = false,
+	};
+
+	err = nvme_get_log(&args);
+	if (err < 0)
+		nvme_show_error("Failed to fetch the log from drive.\n");
+	else if (err > 0) {
+		nvme_show_status(err);
+		nvme_show_error("Failed to fetch telemetry-header. Error:%d.\n", err);
+		goto close_fd;
+	}
+
+	err = write(fd, (void *)hdr, bs);
+	if (err != bs) {
+		nvme_show_error("Failed to write data to file.\n");
+		goto close_fd;
+	}
+
+	full_size = (le16_to_cpu(hdr->dalb3) * bs) + offset;
+
+	while (offset != full_size) {
+		args.log = telemetry_log;
+		args.lpo = offset;
+		args.lsp = NVME_LOG_LSP_NONE;
+		err = nvme_get_log(&args);
+		if (err < 0) {
+			nvme_show_error("Failed to fetch the log from drive.\n");
+			break;
+		} else if (err > 0) {
+			nvme_show_error("Failed to fetch telemetry-log.\n");
+			nvme_show_status(err);
+			break;
+		}
+
+		err = write(fd, (void *)telemetry_log, bs);
+		if (err != bs) {
+			nvme_show_error("Failed to write data to file.\n");
+			break;
+		}
+		err = 0;
+		offset += bs;
+	}
+
+close_fd:
+	close(fd);
+exit_status:
+	free(hdr);
+	free(telemetry_log);
+
+	return err;
+}
+
+static int get_c9_log_page_data(struct nvme_dev *dev, int print_data, int save_bin)
+{
+	int ret = 0, fd;
+	__le64 stat_id_str_table_ofst = 0;
+	__le64 event_str_table_ofst = 0;
+	__le64 vu_event_str_table_ofst = 0;
+	__le64 ascii_table_ofst = 0;
+	char file_path[PATH_MAX];
+
+	header_data = (__u8 *)malloc(sizeof(__u8) * C9_TELEMETRY_STR_LOG_LEN);
+	if (!header_data) {
+		fprintf(stderr, "ERROR : OCP : malloc : %s\n", strerror(errno));
+		return -1;
+	}
+	memset(header_data, 0, sizeof(__u8) * C9_TELEMETRY_STR_LOG_LEN);
+
+	ret = nvme_get_log_simple(dev_fd(dev), C9_TELEMETRY_STRING_LOG_ENABLE_OPCODE,
+				  C9_TELEMETRY_STR_LOG_LEN, header_data);
+
+	if (!ret) {
+		log_data = (struct telemetry_str_log_format *)header_data;
+		if (print_data) {
+			printf("Statistics Identifier String Table Size = %lld\n",
+			       log_data->sitsz);
+			printf("Event String Table Size = %lld\n", log_data->estsz);
+			printf("VU Event String Table Size = %lld\n", log_data->vu_eve_st_sz);
+			printf("ASCII Table Size = %lld\n", log_data->asctsz);
+		}
+
+		//Calculating the offset for dynamic fields.
+
+		stat_id_str_table_ofst = log_data->sits * 4;
+		event_str_table_ofst = log_data->ests * 4;
+		vu_event_str_table_ofst = log_data->vu_eve_sts * 4;
+		ascii_table_ofst = log_data->ascts * 4;
+		total_log_page_sz = C9_TELEMETRY_STR_LOG_LEN +
+		(log_data->sitsz * 4) + (log_data->estsz * 4) +
+		(log_data->vu_eve_st_sz * 4) + (log_data->asctsz * 4);
+
+		if (print_data) {
+			printf("stat_id_str_table_ofst = %lld\n", stat_id_str_table_ofst);
+			printf("event_str_table_ofst = %lld\n", event_str_table_ofst);
+			printf("vu_event_str_table_ofst = %lld\n", vu_event_str_table_ofst);
+			printf("ascii_table_ofst = %lld\n", ascii_table_ofst);
+			printf("total_log_page_sz = %lld\n", total_log_page_sz);
+		}
+
+		pC9_string_buffer = (__u8 *)malloc(sizeof(__u8) * total_log_page_sz);
+		if (!pC9_string_buffer) {
+			fprintf(stderr, "ERROR : OCP : malloc : %s\n", strerror(errno));
+			return -1;
+		}
+		memset(pC9_string_buffer, 0, sizeof(__u8) * total_log_page_sz);
+
+		ret = nvme_get_log_simple(dev_fd(dev), C9_TELEMETRY_STRING_LOG_ENABLE_OPCODE,
+					  total_log_page_sz, pC9_string_buffer);
+	} else
+		fprintf(stderr, "ERROR : OCP : Unable to read C9 data.\n");
+
+	if (save_bin) {
+		sprintf(file_path, DEFAULT_STRING_BIN);
+		fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd < 0) {
+			fprintf(stderr, "Failed to open output file %s: %s!\n",
+				file_path, strerror(errno));
+			goto exit_status;
+		}
+
+		ret = write(fd, (void *)pC9_string_buffer, total_log_page_sz);
+		if (ret != total_log_page_sz)
+			fprintf(stderr, "Failed to flush all data to file!\n");
+
+		close(fd);
+	}
+
+exit_status:
+	return 0;
+}
+
+int parse_ocp_telemetry_log(struct ocp_telemetry_parse_options *options)
+{
+	int status = 0;
+	long telemetry_buffer_size = 0;
+	long string_buffer_size = 0;
+	enum nvme_print_flags fmt;
+	unsigned char log_id;
+
+	if (options->telemetry_log) {
+		if (strstr((const char *)options->telemetry_log, "bin")) {
+			// Read the data from the telemetry binary file
+			ptelemetry_buffer =
+				read_binary_file(NULL, (const char *)options->telemetry_log,
+						 &telemetry_buffer_size, 1);
+			if (ptelemetry_buffer == NULL) {
+				nvme_show_error("Failed to read telemetry-log.\n");
+				return -1;
+			}
+		}
+	} else {
+		nvme_show_error("telemetry-log is empty.\n");
+		return -1;
+	}
+
+	log_id = ptelemetry_buffer[0];
+	if ((log_id != NVME_LOG_LID_TELEMETRY_HOST) && (log_id != NVME_LOG_LID_TELEMETRY_CTRL)) {
+		nvme_show_error("Invalid LogPageId [0x%02X]\n", log_id);
+		return -1;
+	}
+
+	if (options->string_log) {
+		// Read the data from the string binary file
+		if (strstr((const char *)options->string_log, "bin")) {
+			pstring_buffer = read_binary_file(NULL, (const char *)options->string_log,
+							  &string_buffer_size, 1);
+			if (pstring_buffer == NULL) {
+				nvme_show_error("Failed to read string-log.\n");
+				return -1;
+			}
+		}
+	} else {
+		nvme_show_error("string-log is empty.\n");
+		return -1;
+	}
+
+	status = validate_output_format(options->output_format, &fmt);
+	if (status < 0) {
+		nvme_show_error("Invalid output format\n");
+		return status;
+	}
+
+	switch (fmt) {
+	case NORMAL:
+		print_ocp_telemetry_normal(options);
+		break;
+	case JSON:
+		print_ocp_telemetry_json(options);
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
 static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 			      struct plugin *plugin)
 {
-	struct nvme_dev *dev;
-	int err = 0;
-	const char *desc = "Retrieve and save telemetry log.";
-	const char *type = "Telemetry Type; 'host[Create bit]' or 'controller'";
-	const char *area = "Telemetry Data Area; 1 or 3";
-	const char *file = "Output file name with path;\n"
+	const char *desc = "Retrieve and parse OCP Telemetry log.";
+	const char *telemetry_log = "Telemetry log binary;\n 'host.bin' or 'controller.bin'";
+	const char *string_log = "String log binary; 'C9.bin'";
+	const char *output_file = "Output file name with path;\n"
 			"e.g. '-o ./path/name'\n'-o ./path1/path2/';\n"
 			"If requested path does not exist, the directory will be newly created.";
+	const char *output_format = "output format normal|json";
+	const char *data_area = "Telemetry Data Area; 1 or 2;\n"
+			"e.g. '-a 1 for Data Area 1.'\n'-a 2 for Data Areas 1 and 2.';\n";
+	const char *telemetry_type = "Telemetry Type; 'host' or 'controller'";
 
+	struct nvme_dev *dev;
+	int err = 0;
 	__u32  nsid = NVME_NSID_ALL;
 	struct stat nvme_stat;
 	char sn[21] = {0,};
 	struct nvme_id_ctrl ctrl;
 	bool is_support_telemetry_controller;
-
+	struct ocp_telemetry_parse_options opt;
 	int tele_type = 0;
 	int tele_area = 0;
 
-	struct config {
-		char *type;
-		int area;
-		char *file;
-	};
-
-	struct config cfg = {
-		.type = NULL,
-		.area = 0,
-		.file = NULL,
-	};
-
 	OPT_ARGS(opts) = {
-		OPT_STR("telemetry_type", 't', &cfg.type, type),
-		OPT_INT("telemetry_data_area", 'a', &cfg.area, area),
-		OPT_FILE("output-file", 'o', &cfg.file, file),
+		OPT_STR("telemetry-log", 'l', &opt.telemetry_log, telemetry_log),
+		OPT_STR("string-log", 's', &opt.string_log, string_log),
+		OPT_FILE("output-file", 'o', &opt.output_file, output_file),
+		OPT_FMT("output-format", 'f', &opt.output_format, output_format),
+		OPT_INT("data-area", 'a', &opt.data_area, data_area),
+		OPT_STR("telemetry-type", 't', &opt.telemetry_type, telemetry_type),
 		OPT_END()
 	};
 
@@ -1314,36 +1787,84 @@ static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 
 	is_support_telemetry_controller = ((ctrl.lpa & 0x8) >> 3);
 
-	if (!cfg.type && !cfg.area) {
-		tele_type = TELEMETRY_TYPE_NONE;
-		tele_area = 0;
-	} else if (cfg.type && cfg.area) {
-		if (!strcmp(cfg.type, "host0"))
-			tele_type = TELEMETRY_TYPE_HOST_0;
-		else if (!strcmp(cfg.type, "host1"))
-			tele_type = TELEMETRY_TYPE_HOST_1;
-		else if	(!strcmp(cfg.type, "controller"))
-			tele_type = TELEMETRY_TYPE_CONTROLLER;
-
-		tele_area = cfg.area;
-
-		if ((tele_area != 1 && tele_area != 3) ||
-			(tele_type == TELEMETRY_TYPE_CONTROLLER && tele_area != 3)) {
-			printf("\nUnsupported parameters entered.\n");
-			printf("Possible combinations; {'host0',1}, {'host0',3}, {'host1',1}, {'host1',3}, {'controller',3}\n");
-			return err;
-		}
-	} else {
-		printf("\nShould provide these all; 'telemetry_type' and 'telemetry_data_area'\n");
-		return err;
+	if (!opt.data_area) {
+		nvme_show_result("Missing data-area. Using default data area 1.\n");
+		opt.data_area = DATA_AREA_1;//Default data area 1
+	} else if (opt.data_area != 1 && opt.data_area != 2) {
+		nvme_show_result("Invalid data-area specified. Please specify 1 or 2.\n");
+		goto out;
 	}
 
-	if (tele_type == TELEMETRY_TYPE_NONE) {
+	tele_area = opt.data_area;
+
+	if (opt.telemetry_type) {
+		if (!strcmp(opt.telemetry_type, "host0"))
+			tele_type = TELEMETRY_TYPE_HOST_0;
+		else if (!strcmp(opt.telemetry_type, "host1"))
+			tele_type = TELEMETRY_TYPE_HOST_1;
+		else if (!strcmp(opt.telemetry_type, "host"))
+			tele_type = TELEMETRY_TYPE_HOST;
+		else if (!strcmp(opt.telemetry_type, "controller"))
+			tele_type = TELEMETRY_TYPE_CONTROLLER;
+		else {
+			nvme_show_error("telemetry-type should be host or controller.\n");
+			goto out;
+		}
+	} else {
+		tele_type = TELEMETRY_TYPE_HOST; //Default Type - Host
+		nvme_show_result("Missing telemetry-type. Using default - host.\n");
+	}
+
+	if (!opt.telemetry_log) {
+		nvme_show_result("\nMissing telemetry-log. Fetching from drive...\n");
+		err = get_telemetry_log_page_data(dev, tele_type);//Pull Telemetry log
+		if (err) {
+			nvme_show_error("Failed to fetch telemetry-log from the drive.\n");
+			goto out;
+		}
+		nvme_show_result("telemetry.bin generated. Proceeding with next steps.\n");
+		opt.telemetry_log = DEFAULT_TELEMETRY_BIN;
+	}
+
+	if (!opt.string_log) {
+		nvme_show_result("Missing string-log. Fetching from drive...\n");
+		err = get_c9_log_page_data(dev, 0, 1); //Pull String log
+		if (err) {
+			nvme_show_error("Failed to fetch string-log from the drive.\n");
+			goto out;
+		}
+		nvme_show_result("string.bin generated. Proceeding with next steps.\n");
+		opt.string_log = DEFAULT_STRING_BIN;
+	}
+
+	if (!opt.output_format) {
+		nvme_show_result("Missing format. Using default format - JSON.\n");
+		opt.output_format = DEFAULT_OUTPUT_FORMAT_JSON;
+	}
+
+	switch (tele_type) {
+	case TELEMETRY_TYPE_HOST: {
+		printf("Extracting Telemetry Host Dump (Data Area %d)...\n", tele_area);
+		err = parse_ocp_telemetry_log(&opt);
+		if (err)
+			nvme_show_result("Status:(%x)\n", err);
+	}
+	break;
+	case TELEMETRY_TYPE_CONTROLLER: {
+		printf("Extracting Telemetry Controller Dump (Data Area %d)...\n", tele_area);
+		if (is_support_telemetry_controller == true) {
+			err = parse_ocp_telemetry_log(&opt);
+			if (err)
+				nvme_show_result("Status:(%x)\n", err);
+		}
+	}
+	break;
+	case TELEMETRY_TYPE_NONE: {
 		printf("\n-------------------------------------------------------------\n");
 		/* Host 0 (lsp == 0) must be executed before Host 1 (lsp == 1). */
 		printf("\nExtracting Telemetry Host 0 Dump (Data Area 1)...\n");
 
-		err = get_telemetry_dump(dev, cfg.file, sn,
+		err = get_telemetry_dump(dev, opt.output_file, sn,
 				TELEMETRY_TYPE_HOST_0, 1, true);
 		if (err)
 			fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
@@ -1352,7 +1873,7 @@ static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 
 		printf("\nExtracting Telemetry Host 0 Dump (Data Area 3)...\n");
 
-		err = get_telemetry_dump(dev, cfg.file, sn,
+		err = get_telemetry_dump(dev, opt.output_file, sn,
 				TELEMETRY_TYPE_HOST_0, 3, false);
 		if (err)
 			fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
@@ -1361,7 +1882,7 @@ static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 
 		printf("\nExtracting Telemetry Host 1 Dump (Data Area 1)...\n");
 
-		err = get_telemetry_dump(dev, cfg.file, sn,
+		err = get_telemetry_dump(dev, opt.output_file, sn,
 				TELEMETRY_TYPE_HOST_1, 1, true);
 		if (err)
 			fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
@@ -1370,7 +1891,7 @@ static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 
 		printf("\nExtracting Telemetry Host 1 Dump (Data Area 3)...\n");
 
-		err = get_telemetry_dump(dev, cfg.file, sn,
+		err = get_telemetry_dump(dev, opt.output_file, sn,
 				TELEMETRY_TYPE_HOST_1, 3, false);
 		if (err)
 			fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
@@ -1380,34 +1901,34 @@ static int ocp_telemetry_log(int argc, char **argv, struct command *cmd,
 		printf("\nExtracting Telemetry Controller Dump (Data Area 3)...\n");
 
 		if (is_support_telemetry_controller == true) {
-			err = get_telemetry_dump(dev, cfg.file, sn,
+			err = get_telemetry_dump(dev, opt.output_file, sn,
 					TELEMETRY_TYPE_CONTROLLER, 3, true);
 			if (err)
 				fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
 		}
 
 		printf("\n-------------------------------------------------------------\n");
-	} else if (tele_type == TELEMETRY_TYPE_CONTROLLER) {
-		printf("Extracting Telemetry Controller Dump (Data Area %d)...\n", tele_area);
-
-		if (is_support_telemetry_controller == true) {
-			err = get_telemetry_dump(dev, cfg.file, sn, tele_type, tele_area, true);
-			if (err)
-				fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
-		}
-	} else {
+	}
+	break;
+	case TELEMETRY_TYPE_HOST_0:
+	case TELEMETRY_TYPE_HOST_1:
+	default: {
 		printf("Extracting Telemetry Host(%d) Dump (Data Area %d)...\n",
 				(tele_type == TELEMETRY_TYPE_HOST_0) ? 0 : 1, tele_area);
 
-		err = get_telemetry_dump(dev, cfg.file, sn, tele_type, tele_area, true);
+		err = get_telemetry_dump(dev, opt.output_file, sn, tele_type, tele_area, true);
 		if (err)
 			fprintf(stderr, "NVMe Status: %s(%x)\n", nvme_status_to_string(err, false), err);
 	}
+	break;
+	}
 
-	printf("telemetry-log done.\n");
-
-return err;
+	printf("ocp internal-log command completed.\n");
+out:
+	dev_close(dev);
+	return err;
 }
+
 
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
@@ -1511,7 +2032,7 @@ static void ocp_print_c5_log_binary(struct unsupported_requirement_log *log_data
 
 static int get_c5_log_page(struct nvme_dev *dev, char *format)
 {
-	enum nvme_print_flags fmt;
+	nvme_print_flags_t fmt;
 	int ret;
 	__u8 *data;
 	int i;
@@ -1584,7 +2105,6 @@ out:
 	free(data);
 	return ret;
 }
-
 
 static int ocp_unsupported_requirements_log(int argc, char **argv, struct command *cmd,
 					    struct plugin *plugin)
@@ -1738,7 +2258,7 @@ static void ocp_print_c1_log_binary(struct ocp_error_recovery_log_page *log_data
 static int get_c1_log_page(struct nvme_dev *dev, char *format)
 {
 	struct ocp_error_recovery_log_page *log_data;
-	enum nvme_print_flags fmt;
+	nvme_print_flags_t fmt;
 	int ret;
 	__u8 *data;
 	int i, j;
@@ -1954,7 +2474,7 @@ static void ocp_print_c4_log_binary(struct ocp_device_capabilities_log_page *log
 static int get_c4_log_page(struct nvme_dev *dev, char *format)
 {
 	struct ocp_device_capabilities_log_page *log_data;
-	enum nvme_print_flags fmt;
+	nvme_print_flags_t fmt;
 	int ret;
 	__u8 *data;
 	int i, j;
@@ -2617,139 +3137,12 @@ static int get_dssd_async_event_config(int argc, char **argv, struct command *cm
 ///////////////////////////////////////////////////////////////////////////////
 /// Telemetry String Log Format Log Page (LID : C9h)
 
-/* C9 Telemetry String Log Format Log Page */
-#define C9_GUID_LENGTH                           16
-#define C9_TELEMETRY_STRING_LOG_ENABLE_OPCODE    0xC9
-#define C9_TELEMETRY_STR_LOG_LEN                 432
-#define C9_TELEMETRY_STR_LOG_SIST_OFST           431
-
-/**
- * struct telemetry_str_log_format - Telemetry String Log Format
- * @log_page_version:          indicates the version of the mapping this log page uses 
- *                             Shall be set to 01h.
- * @reserved1:                 Reserved.
- * @log_page_guid:             Shall be set to B13A83691A8F408B9EA495940057AA44h.
- * @sls:                       Shall be set to the number of DWORDS in the String Log.
- * @reserved2:                 reserved.
- * @sits:                      shall be set to the number of DWORDS in the Statistics 
- *                             Identifier String Table
- * @ests:                      Shall be set to the number of DWORDS from byte 0 of this 
- *                             log page to the start of the Event String Table
- * @estsz:                     shall be set to the number of DWORDS in the Event String Table
- * @vu_eve_sts:                Shall be set to the number of DWORDS from byte 0 of this 
- *                             log page to the start of the VU Event String Table
- * @vu_eve_st_sz:              shall be set to the number of DWORDS in the VU Event String Table
- * @ascts:                     the number of DWORDS from byte 0 of this log page until the ASCII Table Starts.
- * @asctsz:                    the number of DWORDS in the ASCII Table
- * @fifo1:                     FIFO 0 ASCII String
- * @fifo2:                     FIFO 1 ASCII String
- * @fifo3:                     FIFO 2 ASCII String 
- * @fifo4:                     FIFO 3 ASCII String
- * @fif05:                     FIFO 4 ASCII String
- * @fifo6:                     FIFO 5 ASCII String
- * @fifo7:                     FIFO 6 ASCII String
- * @fifo8:                     FIFO 7 ASCII String
- * @fifo9:                     FIFO 8 ASCII String 
- * @fifo10:                    FIFO 9 ASCII String
- * @fif011:                    FIFO 10 ASCII String
- * @fif012:                    FIFO 11 ASCII String
- * @fifo13:                    FIFO 12 ASCII String
- * @fif014:                    FIFO 13 ASCII String
- * @fif015:                    FIFO 14 ASCII String
- * @fif016:                    FIFO 15 ASCII String
- * @reserved3:                 reserved
- */
-struct __attribute__((__packed__)) telemetry_str_log_format {
-	__u8    log_page_version;
-	__u8    reserved1[15];
-	__u8    log_page_guid[C9_GUID_LENGTH];
-	__le64  sls;
-	__u8    reserved2[24];
-	__le64  sits;
-	__le64  sitsz;
-	__le64  ests;
-	__le64  estsz;
-	__le64  vu_eve_sts;
-	__le64  vu_eve_st_sz;
-	__le64  ascts;
-	__le64  asctsz;
-	__u8    fifo1[16];
-	__u8    fifo2[16];
-	__u8    fifo3[16];
-	__u8    fifo4[16];
-	__u8    fifo5[16];
-	__u8    fifo6[16];
-	__u8    fifo7[16];
-	__u8    fifo8[16];
-	__u8    fifo9[16];
-	__u8    fifo10[16];
-	__u8    fifo11[16];
-	__u8    fifo12[16];
-	__u8    fifo13[16];
-	__u8    fifo14[16];
-	__u8    fifo15[16];
-	__u8    fifo16[16];
-	__u8    reserved3[48];
-};
-
-/*
- * struct statistics_id_str_table_entry - Statistics Identifier String Table Entry
- * @vs_si:                    Shall be set the Vendor Unique Statistic Identifier number.
- * @reserved1:                Reserved
- * @ascii_id_len:             Shall be set the number of ASCII Characters that are valid.
- * @ascii_id_ofst:            Shall be set to the offset from DWORD 0/Byte 0 of the Start 
- *                            of the ASCII Table to the first character of the string for 
- *                            this Statistic Identifier string..
- * @reserved2                 reserved
- */
-struct __attribute__((__packed__)) statistics_id_str_table_entry {
-	__le16  vs_si;
-	__u8    reserved1;
-	__u8    ascii_id_len;
-	__le64  ascii_id_ofst;
-	__le32  reserved2;
-};
-
-/*
- * struct event_id_str_table_entry - Event Identifier String Table Entry
- * @deb_eve_class:            Shall be set the Debug Class.
- * @ei:                       Shall be set to the Event Identifier
- * @ascii_id_len:             Shall be set the number of ASCII Characters that are valid.
- * @ascii_id_ofst:            This is the offset from DWORD 0/ Byte 0 of the start of the
- *                            ASCII table to the ASCII data for this identifier
- * @reserved2                 reserved
- */
-struct __attribute__((__packed__)) event_id_str_table_entry {
-	__u8      deb_eve_class;
-	__le16    ei;
-	__u8      ascii_id_len;
-	__le64    ascii_id_ofst;
-	__le32    reserved2;
-};
-
-/*
- * struct vu_event_id_str_table_entry - VU Event Identifier String Table Entry
- * @deb_eve_class:            Shall be set the Debug Class.
- * @vu_ei:                    Shall be set to the VU Event Identifier
- * @ascii_id_len:             Shall be set the number of ASCII Characters that are valid.
- * @ascii_id_ofst:            This is the offset from DWORD 0/ Byte 0 of the start of the 
- *                            ASCII table to the ASCII data for this identifier
- * @reserved                  reserved
- */
-struct __attribute__((__packed__)) vu_event_id_str_table_entry {
-	__u8      deb_eve_class;
-	__le16    vu_ei;
-	__u8      ascii_id_len;
-	__le64    ascii_id_ofst;
-	__le32    reserved;
-};
-
 /* Function declaration for Telemetry String Log Format (LID:C9h) */
 static int ocp_telemetry_str_log_format(int argc, char **argv, struct command *cmd,
 					struct plugin *plugin);
 
 
-static int ocp_print_C9_log_normal(struct telemetry_str_log_format *log_data,__u8 *log_data_buf)
+static int ocp_print_C9_log_normal(struct telemetry_str_log_format *log_data, __u8 *log_data_buf)
 {
 	//calculating the index value for array
 	__le64 stat_id_index = (log_data->sitsz * 4) / 16;
@@ -2757,14 +3150,13 @@ static int ocp_print_C9_log_normal(struct telemetry_str_log_format *log_data,__u
 	__le64 vu_eve_index = (log_data->vu_eve_st_sz * 4) / 16;
 	__le64 ascii_table_index = (log_data->asctsz * 4);
 	//Calculating the offset for dynamic fields.
-	__le64 stat_id_str_table_ofst = C9_TELEMETRY_STR_LOG_SIST_OFST + (log_data->sitsz * 4);
-	__le64 event_str_table_ofst = stat_id_str_table_ofst + (log_data->estsz * 4);
-	__le64 vu_event_str_table_ofst = event_str_table_ofst + (log_data->vu_eve_st_sz * 4);
-	__le64 ascii_table_ofst = vu_event_str_table_ofst + (log_data->asctsz * 4);
+	__le64 stat_id_str_table_ofst = log_data->sits * 4;
+	__le64 event_str_table_ofst = log_data->ests * 4;
+	__le64 vu_event_str_table_ofst = log_data->vu_eve_sts * 4;
+	__le64 ascii_table_ofst = log_data->ascts * 4;
 	struct statistics_id_str_table_entry stat_id_str_table_arr[stat_id_index];
 	struct event_id_str_table_entry event_id_str_table_arr[eve_id_index];
 	struct vu_event_id_str_table_entry vu_event_id_str_table_arr[vu_eve_index];
-	__u8 ascii_table_info_arr[ascii_table_index];
 	int j;
 
 	printf("  Log Page Version                                : 0x%x\n", log_data->log_page_version);
@@ -2797,172 +3189,180 @@ static int ocp_print_C9_log_normal(struct telemetry_str_log_format *log_data,__u
 
 	printf("  FIFO 1 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo1[j], log_data->fifo1[j]);
-	}
 
 	printf("  FIFO 2 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo2[j], log_data->fifo2[j]);
-	}
 
 	printf("  FIFO 3 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo3[j], log_data->fifo3[j]);
-	}
 
 	printf("  FIFO 4 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
-
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo4[j], log_data->fifo4[j]);
-	}
 
 	printf("  FIFO 5 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo5[j], log_data->fifo5[j]);
-	}
 
 	printf("  FIFO 6 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo6[j], log_data->fifo6[j]);
-	}
 
 	printf("  FIFO 7 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo7[j], log_data->fifo7[j]);
-	}
 
 	printf("  FIFO 8 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
-		printf("index    value    ascii_val");
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo8[j], log_data->fifo8[j]);
-	}
 
 	printf("  FIFO 9 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo9[j], log_data->fifo9[j]);
-	}
 
 	printf("  FIFO 10 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo10[j], log_data->fifo10[j]);
-	}
 
 	printf("  FIFO 11 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo11[j], log_data->fifo11[j]);
-	}
 
 	printf("  FIFO 12 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo12[j], log_data->fifo12[j]);
-	}
 
 	printf("  FIFO 13 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo13[j], log_data->fifo13[j]);
-	}
 
 	printf("  FIFO 14 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo14[j], log_data->fifo14[j]);
-	}
 
 	printf("  FIFO 15 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo15[j], log_data->fifo16[j]);
-	}
 
 	printf("  FIFO 16 ASCII String\n");
 	printf("   index    value    ascii_val\n");
-	for (j = 0; j < 16; j++){
+	for (j = 0; j < 16; j++)
 		printf("  %d       %d        %c    \n", j, log_data->fifo16[j], log_data->fifo16[j]);
-	}
 
 	printf("  Reserved                                        : ");
 	for (j = 0; j < 48; j++)
 		printf("%d", log_data->reserved3[j]);
 	printf("\n");
 
-	memcpy(stat_id_str_table_arr, (__u8*)log_data_buf + stat_id_str_table_ofst, (log_data->sitsz * 4));
-	memcpy(event_id_str_table_arr, (__u8*)log_data_buf + event_str_table_ofst, (log_data->estsz * 4));
-	memcpy(vu_event_id_str_table_arr, (__u8*)log_data_buf + vu_event_str_table_ofst, (log_data->vu_eve_st_sz * 4));
-	memcpy(ascii_table_info_arr, (__u8*)log_data_buf + ascii_table_ofst, (log_data->asctsz * 4));
 
-	printf("  Statistics Identifier String Table\n");
-	for (j = 0; j < stat_id_index; j++){
-		printf("   Vendor Specific Statistic Identifier : 0x%x\n",le16_to_cpu(stat_id_str_table_arr[j].vs_si));
-		printf("   Reserved                             : 0x%d",stat_id_str_table_arr[j].reserved1);
-		printf("   ASCII ID Length                      : 0x%x\n",stat_id_str_table_arr[j].ascii_id_len);
-		printf("   ASCII ID offset                      : 0x%lx\n",le64_to_cpu(stat_id_str_table_arr[j].ascii_id_ofst));
-		printf("   Reserved                             : 0x%d\n",stat_id_str_table_arr[j].reserved2);
+	if (log_data->sitsz != 0) {
+		memcpy(stat_id_str_table_arr,
+		(__u8 *)log_data_buf + stat_id_str_table_ofst,
+		(log_data->sitsz * 4));
+		printf("  Statistics Identifier String Table\n");
+		for (j = 0; j < stat_id_index; j++) {
+			printf("   Vendor Specific Statistic Identifier : 0x%x\n",
+			le16_to_cpu(stat_id_str_table_arr[j].vs_si));
+			printf("   Reserved                             : 0x%x\n",
+			stat_id_str_table_arr[j].reserved1);
+			printf("   ASCII ID Length                      : 0x%x\n",
+			stat_id_str_table_arr[j].ascii_id_len);
+			printf("   ASCII ID offset                      : 0x%lx\n",
+			le64_to_cpu(stat_id_str_table_arr[j].ascii_id_ofst));
+			printf("   Reserved                             : 0x%x\n",
+			stat_id_str_table_arr[j].reserved2);
+		}
 	}
 
-	printf("  Event Identifier String Table Entry\n");
-	for (j = 0; j < eve_id_index; j++){
-		printf("   Debug Event Class        : 0x%x\n",event_id_str_table_arr[j].deb_eve_class);
-		printf("   Event Identifier         : 0x%x\n",le16_to_cpu(event_id_str_table_arr[j].ei));
-		printf("   ASCII ID Length          : 0x%x\n",event_id_str_table_arr[j].ascii_id_len);
-		printf("   ASCII ID offset          : 0x%lx\n",le64_to_cpu(event_id_str_table_arr[j].ascii_id_ofst));
-		printf("   Reserved                 : 0x%d\n",event_id_str_table_arr[j].reserved2);
 
+	if (log_data->estsz != 0) {
+		memcpy(event_id_str_table_arr, (__u8 *)log_data_buf +
+		event_str_table_ofst, (log_data->estsz * 4));
+		printf("  Event Identifier String Table Entry\n");
+		for (j = 0; j < eve_id_index; j++) {
+			printf("   Debug Event Class        : 0x%x\n",
+			event_id_str_table_arr[j].deb_eve_class);
+			printf("   Event Identifier         : 0x%x\n",
+			le16_to_cpu(event_id_str_table_arr[j].ei));
+			printf("   ASCII ID Length          : 0x%x\n",
+			event_id_str_table_arr[j].ascii_id_len);
+			printf("   ASCII ID offset          : 0x%lx\n",
+			le64_to_cpu(event_id_str_table_arr[j].ascii_id_ofst));
+			printf("   Reserved                 : 0x%x\n",
+			event_id_str_table_arr[j].reserved2);
+
+		}
 	}
 
-	printf("  VU Event Identifier String Table Entry\n");
-	for (j = 0; j < vu_eve_index; j++){
-		printf("   Debug Event Class        : 0x%x\n",vu_event_id_str_table_arr[j].deb_eve_class);
-		printf("   VU Event Identifier      : 0x%x\n",le16_to_cpu(vu_event_id_str_table_arr[j].vu_ei));
-		printf("   ASCII ID Length          : 0x%x\n",vu_event_id_str_table_arr[j].ascii_id_len);
-		printf("   ASCII ID offset          : 0x%lx\n",le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_ofst));
-		printf("   Reserved                 : 0x%d\n",vu_event_id_str_table_arr[j].reserved);
+	if (log_data->vu_eve_st_sz != 0) {
+		memcpy(vu_event_id_str_table_arr, (__u8 *)log_data_buf +
+		vu_event_str_table_ofst, (log_data->vu_eve_st_sz * 4));
+		printf("  VU Event Identifier String Table Entry\n");
+		for (j = 0; j < vu_eve_index; j++) {
+			printf("   Debug Event Class        : 0x%x\n",
+			vu_event_id_str_table_arr[j].deb_eve_class);
+			printf("   VU Event Identifier      : 0x%x\n",
+			le16_to_cpu(vu_event_id_str_table_arr[j].vu_ei));
+			printf("   ASCII ID Length          : 0x%x\n",
+			vu_event_id_str_table_arr[j].ascii_id_len);
+			printf("   ASCII ID offset          : 0x%lx\n",
+			le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_ofst));
+			printf("   Reserved                 : 0x%x\n",
+			vu_event_id_str_table_arr[j].reserved);
 
+		}
 	}
 
-	printf("  ASCII Table\n");
-	printf("   Byte    Data_Byte    ASCII_Character\n");
-	for (j = 0; j < ascii_table_index; j++){
-		printf("    %lld        0x%x           %c        \n",ascii_table_ofst+j,ascii_table_info_arr[j],ascii_table_info_arr[j]);
+	if (log_data->asctsz != 0) {
+		printf("  ASCII Table\n");
+		printf("   Byte    Data_Byte    ASCII_Character\n");
+		for (j = 0; j < ascii_table_index; j++)
+			printf("    %lld        %d             %c\n",
+			ascii_table_ofst+j, log_data_buf[ascii_table_ofst + j],
+			(char)log_data_buf[ascii_table_ofst + j]);
 	}
+
 	return 0;
 }
 
-static int ocp_print_C9_log_json(struct telemetry_str_log_format *log_data,__u8 *log_data_buf)
+static int ocp_print_C9_log_json(struct telemetry_str_log_format *log_data, __u8 *log_data_buf)
 {
 	struct json_object *root = json_create_object();
-	struct json_object *stat_table = json_create_object();
-	struct json_object *eve_table = json_create_object();
-	struct json_object *vu_eve_table = json_create_object();
-	struct json_object *entry = json_create_object();
 	char res_arr[48];
 	char *res = res_arr;
 	char guid_buf[C9_GUID_LENGTH];
 	char *guid = guid_buf;
 	char fifo_arr[16];
 	char *fifo = fifo_arr;
+	char buf[128];
 	//calculating the index value for array
 	__le64 stat_id_index = (log_data->sitsz * 4) / 16;
 	__le64 eve_id_index = (log_data->estsz * 4) / 16;
 	__le64 vu_eve_index = (log_data->vu_eve_st_sz * 4) / 16;
 	__le64 ascii_table_index = (log_data->asctsz * 4);
 	//Calculating the offset for dynamic fields.
-	__le64 stat_id_str_table_ofst = C9_TELEMETRY_STR_LOG_SIST_OFST + (log_data->sitsz * 4);
-	__le64 event_str_table_ofst = stat_id_str_table_ofst + (log_data->estsz * 4);
-	__le64 vu_event_str_table_ofst = event_str_table_ofst + (log_data->vu_eve_st_sz * 4);
-	__le64 ascii_table_ofst = vu_event_str_table_ofst + (log_data->asctsz * 4);
+	__le64 stat_id_str_table_ofst = log_data->sits * 4;
+	__le64 event_str_table_ofst = log_data->ests * 4;
+	__le64 vu_event_str_table_ofst = log_data->vu_eve_sts * 4;
+	__le64 ascii_table_ofst = log_data->ascts * 4;
 	struct statistics_id_str_table_entry stat_id_str_table_arr[stat_id_index];
 	struct event_id_str_table_entry event_id_str_table_arr[eve_id_index];
 	struct vu_event_id_str_table_entry vu_event_id_str_table_arr[vu_eve_index];
@@ -3082,74 +3482,117 @@ static int ocp_print_C9_log_json(struct telemetry_str_log_format *log_data,__u8 
 	for (j = 0; j < 48; j++)
 		res += sprintf(res, "%d", log_data->reserved3[j]);
 	json_object_add_value_string(root, "Reserved", res_arr);
-	
-	memcpy(stat_id_str_table_arr, (__u8*)log_data_buf + stat_id_str_table_ofst, (log_data->sitsz * 4));
-	memcpy(event_id_str_table_arr, (__u8*)log_data_buf + event_str_table_ofst, (log_data->estsz * 4));
-	memcpy(vu_event_id_str_table_arr, (__u8*)log_data_buf + vu_event_str_table_ofst, (log_data->vu_eve_st_sz * 4));
-	memcpy(ascii_table_info_arr, (__u8*)log_data_buf + ascii_table_ofst, (log_data->asctsz * 4));
 
-	for (j = 0; j < stat_id_index; j++){
-		json_object_add_value_int(entry, "Vendor Specific Statistic Identifier", le16_to_cpu(stat_id_str_table_arr[j].vs_si));
-		json_object_add_value_int(entry, "Reserved", le64_to_cpu(stat_id_str_table_arr[j].reserved1));
-		json_object_add_value_int(entry, "ASCII ID Length", le64_to_cpu(stat_id_str_table_arr[j].ascii_id_len));
-		json_object_add_value_int(entry, "ASCII ID offset", le64_to_cpu(stat_id_str_table_arr[j].ascii_id_ofst));
-		json_object_add_value_int(entry, "Reserved", le64_to_cpu(stat_id_str_table_arr[j].reserved2));
-		json_array_add_value_object(stat_table, entry);
+	if (log_data->sitsz != 0) {
+
+		memcpy(stat_id_str_table_arr,
+		(__u8 *)log_data_buf + stat_id_str_table_ofst,
+		(log_data->sitsz * 4));
+		struct json_object *stat_table = json_create_object();
+
+		for (j = 0; j < stat_id_index; j++) {
+			struct json_object *entry = json_create_object();
+
+			json_object_add_value_uint(entry, "Vendor Specific Statistic Identifier",
+			le16_to_cpu(stat_id_str_table_arr[j].vs_si));
+			json_object_add_value_uint(entry, "Reserved",
+			le64_to_cpu(stat_id_str_table_arr[j].reserved1));
+			json_object_add_value_uint(entry, "ASCII ID Length",
+			le64_to_cpu(stat_id_str_table_arr[j].ascii_id_len));
+			json_object_add_value_uint(entry, "ASCII ID offset",
+			le64_to_cpu(stat_id_str_table_arr[j].ascii_id_ofst));
+			json_object_add_value_uint(entry, "Reserved2",
+			le64_to_cpu(stat_id_str_table_arr[j].reserved2));
+			sprintf(buf, "Statistics Identifier String Table %d", j);
+			json_object_add_value_object(stat_table, buf, entry);
+		}
+
+		json_object_add_value_object(root,
+		"Statistics Identifier String Table", stat_table);
 	}
-	json_object_add_value_array(root, "Statistics Identifier String Table", stat_table);
 
-	for (j = 0; j < eve_id_index; j++){
-		json_object_add_value_int(entry, "Debug Event Class", le16_to_cpu(event_id_str_table_arr[j].deb_eve_class));
-		json_object_add_value_int(entry, "Event Identifier", le16_to_cpu(event_id_str_table_arr[j].ei));
-		json_object_add_value_int(entry, "ASCII ID Length", le64_to_cpu(event_id_str_table_arr[j].ascii_id_len));
-		json_object_add_value_int(entry, "ASCII ID offset", le64_to_cpu(event_id_str_table_arr[j].ascii_id_ofst));
-		json_object_add_value_int(entry, "Reserved", le64_to_cpu(event_id_str_table_arr[j].reserved2));
-		json_array_add_value_object(eve_table, entry);
+	if (log_data->estsz != 0) {
+		struct json_object *eve_table = json_create_object();
+
+		memcpy(event_id_str_table_arr,
+		(__u8 *)log_data_buf + event_str_table_ofst,
+		(log_data->estsz * 4));
+		for (j = 0; j < eve_id_index; j++) {
+			struct json_object *entry = json_create_object();
+
+			json_object_add_value_int(entry, "Debug Event Class",
+			le16_to_cpu(event_id_str_table_arr[j].deb_eve_class));
+			json_object_add_value_int(entry, "Event Identifier",
+			le16_to_cpu(event_id_str_table_arr[j].ei));
+			json_object_add_value_int(entry, "ASCII ID Length",
+			le64_to_cpu(event_id_str_table_arr[j].ascii_id_len));
+			json_object_add_value_int(entry, "ASCII ID offset",
+			le64_to_cpu(event_id_str_table_arr[j].ascii_id_ofst));
+			json_object_add_value_int(entry, "Reserved",
+			le64_to_cpu(event_id_str_table_arr[j].reserved2));
+			sprintf(buf, "Event Identifier String Table Entry %d", j);
+			json_object_add_value_object(eve_table, buf, entry);
+		}
+		json_object_add_value_object(root,
+		"Event Identifier String Table Entry",
+		eve_table);
 	}
-	json_object_add_value_array(root, "Event Identifier String Table Entry", eve_table);
 
-	for (j = 0; j < vu_eve_index; j++){
-		json_object_add_value_int(entry, "Debug Event Class", le16_to_cpu(vu_event_id_str_table_arr[j].deb_eve_class));
-		json_object_add_value_int(entry, "VU Event Identifier", le16_to_cpu(vu_event_id_str_table_arr[j].vu_ei));
-		json_object_add_value_int(entry, "ASCII ID Length", le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_len));
-		json_object_add_value_int(entry, "ASCII ID offset", le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_ofst));
-		json_object_add_value_int(entry, "Reserved", le64_to_cpu(vu_event_id_str_table_arr[j].reserved));
-		json_array_add_value_object(vu_eve_table, entry);
+	if (log_data->vu_eve_st_sz != 0) {
+		struct json_object *vu_eve_table = json_create_object();
+
+		memcpy(vu_event_id_str_table_arr,
+		(__u8 *)log_data_buf + vu_event_str_table_ofst,
+		(log_data->vu_eve_st_sz * 4));
+		for (j = 0; j < vu_eve_index; j++) {
+			struct json_object *entry = json_create_object();
+
+			json_object_add_value_int(entry, "Debug Event Class",
+			le16_to_cpu(vu_event_id_str_table_arr[j].deb_eve_class));
+			json_object_add_value_int(entry, "VU Event Identifier",
+			le16_to_cpu(vu_event_id_str_table_arr[j].vu_ei));
+			json_object_add_value_int(entry, "ASCII ID Length",
+			le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_len));
+			json_object_add_value_int(entry, "ASCII ID offset",
+			le64_to_cpu(vu_event_id_str_table_arr[j].ascii_id_ofst));
+			json_object_add_value_int(entry, "Reserved",
+			le64_to_cpu(vu_event_id_str_table_arr[j].reserved));
+			sprintf(buf, "VU Event Identifier String Table Entry %d", j);
+			json_object_add_value_object(vu_eve_table, buf, entry);
+		}
+		json_object_add_value_object(root,
+		"VU Event Identifier String Table Entry",
+		vu_eve_table);
 	}
-	json_object_add_value_array(root, "VU Event Identifier String Table Entry", vu_eve_table);
 
-	memset((void *)ascii, 0, ascii_table_index);
-	for (j = 0; j < ascii_table_index; j++)
-		ascii += sprintf(ascii, "%c", ascii_table_info_arr[j]);
-	json_object_add_value_string(root, "ASCII Table", ascii_buf);
+	if (log_data->asctsz != 0) {
+		memcpy(ascii_table_info_arr,
+		(__u8 *)log_data_buf + ascii_table_ofst,
+		(log_data->asctsz * 4));
+		memset((void *)ascii, 0, ascii_table_index);
+		for (j = 0; j < ascii_table_index; j++)
+			ascii += sprintf(ascii, "%c", ascii_table_info_arr[j]);
+		json_object_add_value_string(root, "ASCII Table", ascii_buf);
+	}
 
 	json_print_object(root, NULL);
 	printf("\n");
 	json_free_object(root);
-	json_free_object(stat_table);
-	json_free_object(eve_table);
-	json_free_object(vu_eve_table);
 
 	return 0;
 }
 
-static void ocp_print_c9_log_binary(__u8 *log_data_buf,int total_log_page_size)
+static void ocp_print_c9_log_binary(__u8 *log_data_buf, int total_log_page_size)
 {
 	return d_raw((unsigned char *)log_data_buf, total_log_page_size);
 }
 
 static int get_c9_log_page(struct nvme_dev *dev, char *format)
 {
+
 	int ret = 0;
-	__u8 *header_data;
-	struct telemetry_str_log_format *log_data;
-	enum nvme_print_flags fmt;
-	__u8 *full_log_buf_data = NULL;
-	__le64 stat_id_str_table_ofst = 0;
-	__le64 event_str_table_ofst = 0;
-	__le64 vu_event_str_table_ofst = 0;
-	__le64 ascii_table_ofst = 0;
-	__le64 total_log_page_sz = 0;
+
+	nvme_print_flags_t fmt;
 
 	ret = validate_output_format(format, &fmt);
 	if (ret < 0) {
@@ -3157,71 +3600,26 @@ static int get_c9_log_page(struct nvme_dev *dev, char *format)
 		return ret;
 	}
 
-	header_data = (__u8 *)malloc(sizeof(__u8) * C9_TELEMETRY_STR_LOG_LEN);
-	if (!header_data) {
-		fprintf(stderr, "ERROR : OCP : malloc : %s\n", strerror(errno));
-		return -1;
-	}
-	memset(header_data, 0, sizeof(__u8) * C9_TELEMETRY_STR_LOG_LEN);
-
-	ret = nvme_get_log_simple(dev_fd(dev), C9_TELEMETRY_STRING_LOG_ENABLE_OPCODE,
-				  C9_TELEMETRY_STR_LOG_LEN, header_data);
+	get_c9_log_page_data(dev, 1, 0);
 
 	if (!ret) {
-		log_data = (struct telemetry_str_log_format *)header_data;
-		printf("Statistics Identifier String Table Size = %lld\n",log_data->sitsz);
-		printf("Event String Table Size = %lld\n",log_data->estsz);
-		printf("VU Event String Table Size = %lld\n",log_data->vu_eve_st_sz);
-		printf("ASCII Table Size = %lld\n",log_data->asctsz);
-
-		//Calculating the offset for dynamic fields.
-		stat_id_str_table_ofst = C9_TELEMETRY_STR_LOG_SIST_OFST + (log_data->sitsz * 4);
-		event_str_table_ofst = stat_id_str_table_ofst + (log_data->estsz * 4);
-		vu_event_str_table_ofst = event_str_table_ofst + (log_data->vu_eve_st_sz * 4);
-		ascii_table_ofst = vu_event_str_table_ofst + (log_data->asctsz * 4);
-		total_log_page_sz = stat_id_str_table_ofst + event_str_table_ofst + vu_event_str_table_ofst + ascii_table_ofst;
-
-		printf("stat_id_str_table_ofst = %lld\n",stat_id_str_table_ofst);
-		printf("event_str_table_ofst = %lld\n",event_str_table_ofst);
-		printf("vu_event_str_table_ofst = %lld\n",vu_event_str_table_ofst);
-		printf("ascii_table_ofst = %lld\n",ascii_table_ofst);
-		printf("total_log_page_sz = %lld\n",total_log_page_sz);
-
-		full_log_buf_data = (__u8 *)malloc(sizeof(__u8) * total_log_page_sz);
-		if (!full_log_buf_data) {
-			fprintf(stderr, "ERROR : OCP : malloc : %s\n", strerror(errno));
-			return -1;
+		switch (fmt) {
+		case NORMAL:
+			ocp_print_C9_log_normal(log_data, pC9_string_buffer);
+			break;
+		case JSON:
+			ocp_print_C9_log_json(log_data, pC9_string_buffer);
+			break;
+		case BINARY:
+			ocp_print_c9_log_binary(pC9_string_buffer, total_log_page_sz);
+			break;
+		default:
+			fprintf(stderr, "unhandled output format\n");
+			break;
 		}
-		memset(full_log_buf_data, 0, sizeof(__u8) * total_log_page_sz);
-
-		ret = nvme_get_log_simple(dev_fd(dev), C9_TELEMETRY_STRING_LOG_ENABLE_OPCODE,
-					  total_log_page_sz, full_log_buf_data);
-
-		if (!ret) {
-			switch (fmt) {
-			case NORMAL:
-				ocp_print_C9_log_normal(log_data,full_log_buf_data);
-				break;
-			case JSON:
-				ocp_print_C9_log_json(log_data,full_log_buf_data);
-				break;
-			case BINARY:
-				ocp_print_c9_log_binary(full_log_buf_data,total_log_page_sz);
-				break;
-			default:
-				fprintf(stderr, "unhandled output format\n");
-				break;
-			}
-		} else{
-			fprintf(stderr, "ERROR : OCP : Unable to read C9 data from buffer\n");
-		}
-	} else {
+	} else
 		fprintf(stderr, "ERROR : OCP : Unable to read C9 data from buffer\n");
-	}
-
 	free(header_data);
-	free(full_log_buf_data);
-
 	return ret;
 }
 
@@ -3435,7 +3833,7 @@ static void ocp_print_c7_log_binary(struct tcg_configuration_log *log_data)
 
 static int get_c7_log_page(struct nvme_dev *dev, char *format)
 {
-	enum nvme_print_flags fmt;
+	nvme_print_flags_t fmt;
 	int ret;
 	__u8 *data;
 	int i;
@@ -3570,4 +3968,178 @@ static int fw_activation_history_log(int argc, char **argv, struct command *cmd,
 				     struct plugin *plugin)
 {
 	return ocp_fw_activation_history_log(argc, argv, cmd, plugin);
+}
+
+static int error_injection_get(struct nvme_dev *dev, const __u8 sel, bool uuid)
+{
+	struct erri_get_cq_entry cq_entry;
+	int err;
+	int i;
+	const __u8 fid = 0xc0;
+
+	_cleanup_free_ struct erri_entry *entry = NULL;
+
+	struct nvme_get_features_args args = {
+		.result = (__u32 *)&cq_entry,
+		.data = entry,
+		.args_size = sizeof(args),
+		.fd = dev_fd(dev),
+		.timeout = NVME_DEFAULT_IOCTL_TIMEOUT,
+		.sel = sel,
+		.data_len = sizeof(*entry) * ERRI_ENTRIES_MAX,
+		.fid = fid,
+	};
+
+	if (uuid) {
+		/* OCP 2.0 requires UUID index support */
+		err = ocp_get_uuid_index(dev, &args.uuidx);
+		if (err || !args.uuidx) {
+			nvme_show_error("ERROR: No OCP UUID index found");
+			return err;
+		}
+	}
+
+	entry = nvme_alloc(args.data_len);
+	if (!entry) {
+		nvme_show_error("malloc: %s", strerror(errno));
+		return -errno;
+	}
+
+	err = nvme_cli_get_features(dev, &args);
+	if (!err) {
+		nvme_show_result("Number of Error Injecttions (feature: %#0*x): %#0*x (%s: %d)",
+				 fid ? 4 : 2, fid, cq_entry.nume ? 10 : 8, cq_entry.nume,
+				 nvme_select_to_string(sel), cq_entry.nume);
+		if (sel == NVME_GET_FEATURES_SEL_SUPPORTED)
+			nvme_show_select_result(fid, *args.result);
+		for (i = 0; i < cq_entry.nume; i++) {
+			printf("Entry: %d, Flags: %x (%s%s), Type: %x (%s), NRTDP: %d\n", i,
+			       entry->flags, entry->enable ? "Enabled" : "Disabled",
+			       entry->single ? ", Single instance" : "", entry->type,
+			       erri_type_to_string(entry->type), entry->nrtdp);
+		}
+	} else {
+		nvme_show_error("Could not get feature: %#0*x.", fid ? 4 : 2, fid);
+	}
+
+	return err;
+}
+
+static int get_error_injection(int argc, char **argv, struct command *cmd, struct plugin *plugin)
+{
+	const char *desc = "Return set of error injection";
+	int err;
+	struct config {
+		__u8 sel;
+	};
+	struct config cfg = { 0 };
+
+	_cleanup_nvme_dev_ struct nvme_dev *dev = NULL;
+
+	OPT_ARGS(opts) = {
+		OPT_BYTE("sel", 's', &cfg.sel, sel),
+		OPT_FLAG("no-uuid", 'n', NULL, no_uuid),
+		OPT_END()
+	};
+
+	err = parse_and_open(&dev, argc, argv, desc, opts);
+	if (err)
+		return err;
+
+	return error_injection_get(dev, cfg.sel, !argconfig_parse_seen(opts, "no-uuid"));
+}
+
+static int error_injection_set(struct nvme_dev *dev, struct erri_config *cfg, bool uuid)
+{
+	int err;
+	__u32 result;
+	struct nvme_set_features_args args = {
+		.args_size = sizeof(args),
+		.fd = dev_fd(dev),
+		.fid = 0xc0,
+		.cdw11 = cfg->number,
+		.data_len = cfg->number * sizeof(struct erri_entry),
+		.timeout = nvme_cfg.timeout,
+		.result = &result,
+	};
+
+	_cleanup_fd_ int ffd = -1;
+
+	_cleanup_free_ struct erri_entry *entry = NULL;
+
+	if (uuid) {
+		/* OCP 2.0 requires UUID index support */
+		err = ocp_get_uuid_index(dev, &args.uuidx);
+		if (err || !args.uuidx) {
+			nvme_show_error("ERROR: No OCP UUID index found");
+			return err;
+		}
+	}
+
+	entry = nvme_alloc(args.data_len);
+	if (!entry) {
+		nvme_show_error("malloc: %s", strerror(errno));
+		return -errno;
+	}
+
+	if (cfg->file && strlen(cfg->file)) {
+		ffd = open(cfg->file, O_RDONLY);
+		if (ffd < 0) {
+			nvme_show_error("Failed to open file %s: %s", cfg->file, strerror(errno));
+			return -EINVAL;
+		}
+		err = read(ffd, entry, args.data_len);
+		if (err < 0) {
+			nvme_show_error("failed to read data buffer from input file: %s",
+					strerror(errno));
+			return -errno;
+		}
+	} else {
+		entry->enable = 1;
+		entry->single = 1;
+		entry->type = cfg->type;
+		entry->nrtdp = cfg->nrtdp;
+	}
+
+	args.data = entry;
+
+	err = nvme_set_features(&args);
+	if (err) {
+		if (err < 0)
+			nvme_show_error("set-error-injection: %s", nvme_strerror(errno));
+		else if (err > 0)
+			nvme_show_status(err);
+		return err;
+	}
+
+	printf("set-error-injection, data: %s, number: %d, uuid: %d, type: %d, nrtdp: %d\n",
+	       cfg->file, cfg->number, args.uuidx, cfg->type, cfg->nrtdp);
+	if (args.data)
+		d(args.data, args.data_len, 16, 1);
+
+	return 0;
+}
+
+static int set_error_injection(int argc, char **argv, struct command *cmd, struct plugin *plugin)
+{
+	const char *desc = "Inject error conditions";
+	int err;
+	struct erri_config cfg = {
+		.number = 1,
+	};
+
+	_cleanup_nvme_dev_ struct nvme_dev *dev = NULL;
+
+	NVME_ARGS(opts,
+		  OPT_FILE("data", 'd', &cfg.file, data),
+		  OPT_BYTE("number", 'n', &cfg.number, number),
+		  OPT_FLAG("no-uuid", 'N', NULL, no_uuid),
+		  OPT_SHRT("type", 't', &cfg.type, type),
+		  OPT_SHRT("nrtdp", 'r', &cfg.nrtdp, nrtdp));
+
+	err = parse_and_open(&dev, argc, argv, desc, opts);
+	if (err)
+		return err;
+
+	return error_injection_set(dev, &cfg, !argconfig_parse_seen(opts, "no-uuid"));
 }

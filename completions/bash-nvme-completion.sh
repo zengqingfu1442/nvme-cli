@@ -149,7 +149,7 @@ nvme_list_opts () {
 			;;
 		"smart-log")
 		opts+=" --namespace-id= -n --raw-binary -b \
-			--output-format= -o --verbose -v --fahrenheit -f"
+			--output-format= -o --verbose -v"
 			;;
 		"ana-log")
 		opts+=" --output-format -o"
@@ -388,7 +388,7 @@ nvme_list_opts () {
 			--tos= -T --hdr-digest= -g --data-digest -G \
 			--nr-io-queues= -i --nr-write-queues= -W \
 			--nr-poll-queues= -P --queue-size= -Q \
-			--persistent -p --quiet -S \
+			--persistent -p --quiet \
 			--output-format= -o"
 			;;
 		"connect-all")
@@ -400,7 +400,7 @@ nvme_list_opts () {
 			--tos= -T --hdr-digest= -g --data-digest -G \
 			--nr-io-queues= -i --nr-write-queues= -W \
 			--nr-poll-queues= -P --queue-size= -Q \
-			--persistent -p --quiet -S \
+			--persistent -p --quiet \
 			--output-format= -o"
 			;;
 		"connect")
@@ -409,7 +409,7 @@ nvme_list_opts () {
 			--nr-poll-queues= -P --queue-size= -Q \
 			--keep-alive-tmo= -k --reconnect-delay= -r \
 			--ctrl-loss-tmo= -l --fast-io-fail-tmo= -f \
-			--tos= -T --duplicate-connect -D --disable-sqflow -d\
+			--tos= -T --duplicate-connect -D --disable-sqflow \
 			--hdr-digest -g --data-digest -G --output-format= -o"
 			;;
 		"dim")
@@ -426,6 +426,11 @@ nvme_list_opts () {
 			;;
 		"show-hostnqn")
 		opts+=$NO_OPTS
+			;;
+		"tls-key")
+		opts+=" --output-format= -o --verbose -v --keyring= -k \
+			--keytype= -k --keyfile= -f --import -i \
+			--export -e --revoke= -r"
 			;;
 		"dir-receive")
 		opts+=" --namespace-id= -n --data-len= -l --raw-binary -b \
@@ -1223,6 +1228,38 @@ plugin_transcend_opts () {
 	return 0
 }
 
+plugin_dapustor_opts () {
+	local opts=""
+	local compargs=""
+
+	local nonopt_args=0
+	for (( i=0; i < ${#words[@]}-1; i++ )); do
+		if [[ ${words[i]} != -* ]]; then
+			let nonopt_args+=1
+		fi
+	done
+
+	if [ $nonopt_args -eq 3 ]; then
+		opts="/dev/nvme* "
+	fi
+
+	opts+=" "
+
+	case "$1" in
+		"smart-log-add")
+		opts+=" --namespace-id= -n --raw-binary -b \
+			--json -j"
+			;;
+		"help")
+		opts+=$NO_OPTS
+			;;
+	esac
+
+	COMPREPLY+=( $( compgen $compargs -W "$opts" -- $cur ) )
+
+	return 0
+}
+
 plugin_zns_opts () {
 	local opts=""
 	local compargs=""
@@ -1439,8 +1476,9 @@ plugin_ocp_opts () {
 			--latency_monitor_feature_enable= -e"
 			;;
 		"internal-log")
-		opts+=" --telemetry_type= -t --telemetry_data_area= -a \
-			--output-file= -o"
+		opts+=" --telemetry-log= -l --string-log= -s \
+			--output-file= -o --output-format= -f \
+			--data-area= -a --telemetry-type= -t"
 			;;
 		"clear-fw-activate-history")
 		opts+=" --no-uuid -n"
@@ -1477,6 +1515,13 @@ plugin_ocp_opts () {
 			;;
 		"tcg-configuration-log")
 		opts+=" --output-file= -o"
+			;;
+		"get-error-injection")
+		opts+=" --sel= -s --no-uuid -n"
+			;;
+		"set-error-injection")
+		opts+=" --data= -d --number= -n --no-uuid -N --type= -t \
+			--nrtdp= -r --verbose -v --output-format -o --timeout="
 			;;
 		"help")
 		opts+=$NO_OPTS
@@ -1524,7 +1569,7 @@ _nvme_subcmds () {
 			vs-drive-info plugin-version cloud-SSD-plugin-version \
 			log-page-directory vs-fw-activate-history \
 			vs-error-reason-identifier vs-smart-add-log \
-			clear-fw-activate-history vs-smbus-option"
+			clear-fw-activate-history vs-smbus-option ocp-telemetry-log-parse"
 		[seagate]="vs-temperature-stats vs-log-page-sup \
 			vs-smart-add-log vs-pcie-stats clear-pcie-correctable-errors \
 			get-host-tele get-ctrl-tele vs-internal-log \
@@ -1541,6 +1586,7 @@ _nvme_subcmds () {
 			vs-drive-info cloud-SSDplugin-version market-log \
 			smart-log-add temp-stats version help"
 		[transcend]="healthvalue badblock"
+		[dapustor]="smart-log-add"
 		[zns]="id-ctrl id-ns zone-mgmt-recv \
 			zone-mgmt-send report-zones close-zone \
 			finish-zone open-zone reset-zone offline-zone \
@@ -1555,7 +1601,8 @@ _nvme_subcmds () {
 			vs-fw-activate-history device-capability-log \
 			set-dssd-power-state-feature get-dssd-power-state-feature \
 			telemetry-string-log set-telemetry-profile \
-			set-dssd-async-event-config get-dssd-async-event-config"
+			set-dssd-async-event-config get-dssd-async-event-config \
+			get-error-injection set-error-injection"
 	)
 
 	# Associative array mapping plugins to corresponding option completions
@@ -1574,6 +1621,7 @@ _nvme_subcmds () {
 		[sfx]="plugin_sfx_opts"
 		[solidigm]="plugin_solidigm_opts"
 		[transcend]="plugin_transcend_opts"
+		[dapustor]="plugin_dapustor_opts"
 		[zns]="plugin_zns_opts"
 		[nvidia]="plugin_nvidia_opts"
 		[ymtc]="plugin_ymtc_opts"
@@ -1603,7 +1651,7 @@ _nvme_subcmds () {
 		sanitize sanitize-log reset subsystem-reset \
 		ns-rescan show-regs discover connect-all \
 		connect disconnect disconnect-all gen-hostnqn \
-		show-hostnqn dir-receive dir-send virt-mgmt \
+		show-hostnqn tls-key dir-receive dir-send virt-mgmt \
 		rpmb boot-part-log fid-support-effects-log \
 		supported-log-pages lockdown media-unit-stat-log \
 		supported-cap-config-log dim show-topology list-endgrp \

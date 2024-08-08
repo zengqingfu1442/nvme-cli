@@ -22,6 +22,8 @@ usage() {
     echo "  coverage            build coverage report"
     echo "  appimage            build AppImage target"
     echo "  distro              build libnvme and nvme-cli separately"
+    echo "  docs                build documentation"
+    echo "  static              build a static binary"
     echo ""
     echo "configs with muon:"
     echo "  [default]           minimal static build"
@@ -116,6 +118,26 @@ config_meson_appimage() {
         "${BUILDDIR}"
 }
 
+config_meson_docs() {
+    CC="${CC}" "${MESON}" setup                 \
+        -Ddocs=all                              \
+        -Ddocs-build=true                       \
+        --force-fallback-for=libnvme            \
+        --prefix=/tmp/usr                       \
+        -Dlibnvme:werror=false                  \
+        "${BUILDDIR}"
+}
+
+config_meson_static() {
+    CC="${CC}" "${MESON}" setup                 \
+        --buildtype=release                     \
+        --default-library=static                \
+        --wrap-mode=forcefallback               \
+        -Dc_link_args="-static"                 \
+        -Dlibnvme:keyutils=disabled             \
+        "${BUILDDIR}"
+}
+
 build_meson() {
     "${MESON}" compile                          \
         -C "${BUILDDIR}"
@@ -133,7 +155,12 @@ test_meson_coverage() {
 }
 
 install_meson_appimage() {
-    "${MESON}" install                             \
+    "${MESON}" install                          \
+        -C "${BUILDDIR}"
+}
+
+install_meson_docs() {
+    "${MESON}" install                          \
         -C "${BUILDDIR}"
 }
 

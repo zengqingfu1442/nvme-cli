@@ -1,4 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Copyright (c) Micron, Inc 2024.
+ *
+ * @file: micron-nvme.h
+ * @brief: This module contains all the constructs needed for micron nvme-cli plugin.
+ * @authors:Chaithanya Shoba <ashoba@micron.com>,
+ */
 #undef CMD_INC_FILE
 #define CMD_INC_FILE plugins/micron/micron-nvme
 
